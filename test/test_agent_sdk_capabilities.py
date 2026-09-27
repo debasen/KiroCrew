@@ -337,6 +337,7 @@ def test_known_membership_is_unchanged_by_the_move() -> None:
     """
     assert sorted(sdk_backends.ACP_BACKENDS_KNOWN) == [
         "",
+        "agy",
         "claude",
         "codex",
         "deepseek",

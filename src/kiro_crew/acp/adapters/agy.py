@@ -259,7 +259,18 @@ class AgyAcpServer:
             while True:
                 line = await session.proc.stdout.readline()
                 if not line:
-                    break
+                    exit_code = session.proc.returncode
+                    if exit_code is None:
+                        try:
+                            exit_code = await asyncio.wait_for(session.proc.wait(), timeout=1.0)
+                        except (asyncio.TimeoutError, Exception):
+                            exit_code = session.proc.returncode
+                    self._write_error(
+                        req_id,
+                        -32000,
+                        f"agy process exited with code {exit_code}",
+                    )
+                    return
                 try:
                     data = json.loads(line.decode("utf-8"))
                 except json.JSONDecodeError:
@@ -437,6 +448,10 @@ class AgyAcpServer:
                     session.proc = proc
                 except Exception as exc:
                     logger.warning("Failed to respawn agy process with model %s: %s", value, exc)
+                    self._write_error(
+                        req_id, -32000, f"failed to respawn agy process with model {value}: {exc}"
+                    )
+                    return
         elif config_id == "effort":
             self.default_effort = str(value)
             if session and session.effort != str(value):
@@ -452,6 +467,10 @@ class AgyAcpServer:
                     session.proc = proc
                 except Exception as exc:
                     logger.warning("Failed to respawn agy process with effort %s: %s", value, exc)
+                    self._write_error(
+                        req_id, -32000, f"failed to respawn agy process with effort {value}: {exc}"
+                    )
+                    return
         self._write_response(req_id, {})
 
     async def handle_set_model(self, req_id: Any, params: Dict[str, Any]) -> None:
@@ -474,6 +493,12 @@ class AgyAcpServer:
                     session.proc = proc
                 except Exception as exc:
                     logger.warning("Failed to respawn agy process with model %s: %s", model_id, exc)
+                    self._write_error(
+                        req_id,
+                        -32000,
+                        f"failed to respawn agy process with model {model_id}: {exc}",
+                    )
+                    return
         self._write_response(req_id, {})
 
     async def dispatch_request(self, message: Dict[str, Any]) -> None:

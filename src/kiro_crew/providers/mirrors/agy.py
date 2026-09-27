@@ -13,7 +13,6 @@ from kiro_crew.agent_sdk.backends import ACP_BACKEND_AGY
 from kiro_crew.providers.mirrors.base import AgentConfigMirror, Concern
 from kiro_crew.providers.mirrors.base import Disposition as _D
 from kiro_crew.providers.mirrors.base import Ruling, SessionProjection
-from kiro_crew.providers.mirrors.opencode import opencode_projection
 
 __all__ = ["AgyMirror", "agy_projection"]
 
@@ -40,18 +39,17 @@ class AgyMirror(AgentConfigMirror):
     def rulings(self) -> Mapping[Concern, Ruling]:
         return {
             Concern.MCP_SERVERS: Ruling(
-                _D.WITHHELD,
-                "withheld: agy-acp does not forward workspace-external MCP servers to prevent credential exposure",
+                _D.DELIVERED,
+                "the session/new and session/load mcpServers array, translated onto "
+                "the wire parameters for the in-tree agy-acp adapter",
             ),
             Concern.TOOL_ALLOWLIST: Ruling(
-                _D.TRANSLATED,
-                "into the allowlist deciding which servers enter the array, matching "
-                "the shared translation rule",
+                _D.WITHHELD,
+                "the harness does not translate a tool allowlist into its session configuration",
             ),
             Concern.DENIED_TOOLS: Ruling(
-                _D.TRANSLATED,
-                "by withholding the server whole on per_tool_deny=whole-server, "
-                "preventing un-allowed tools from being reachable",
+                _D.WITHHELD,
+                "the harness does not translate denied tools into its session configuration",
             ),
             Concern.MODEL: Ruling(
                 _D.DELIVERED,

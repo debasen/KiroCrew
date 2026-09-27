@@ -6849,10 +6849,6 @@ class AcpClient:
         )
         return servers
 
-    def _agy_session_mcp_servers(self) -> list:
-        """MCP server array passed to an agy ``session/new`` / ``session/load``."""
-        return self._session_mcp_servers()
-
     def _claude_local_settings_path(self) -> Path:
         return self._work_dir / ".claude" / "settings.local.json"
 
@@ -10385,7 +10381,6 @@ class AcpClient:
                 *(self._claude_session_mcp_servers() if self._is_claude else []),
                 *(self._opencode_session_mcp_servers() if self._is_opencode else []),
                 *(self._goose_session_mcp_servers() if self._is_goose else []),
-                *(self._agy_session_mcp_servers() if self._is_agy else []),
                 *(await asyncio.to_thread(self._pooled_mcp_servers)),
             ],
         }
@@ -10580,7 +10575,6 @@ class AcpClient:
                             *(self._claude_session_mcp_servers() if self._is_claude else []),
                             *(self._opencode_session_mcp_servers() if self._is_opencode else []),
                             *(self._goose_session_mcp_servers() if self._is_goose else []),
-                            *(self._agy_session_mcp_servers() if self._is_agy else []),
                             *(await asyncio.to_thread(self._pooled_mcp_servers)),
                         ],
                     }

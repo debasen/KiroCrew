@@ -369,8 +369,8 @@ PROJECTIONS: dict[str, McpProjection] = {
     ACP_BACKEND_AGY: McpProjection(
         kind=ProjectionKind.MIRROR,
         reason=(
-            "agy.py -- MCP servers are withheld so params has empty mcpServers "
-            "to prevent workspace or credential exposure on an unverified routing"
+            "agy.py -- projects agent spec mcpServers into the session/new and "
+            "session/load array for the in-tree agy-acp stream-json adapter"
         ),
         per_tool_deny=PerToolDeny.WHOLE_SERVER,
     ),

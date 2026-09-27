@@ -5,10 +5,13 @@ Google Antigravity CLI (agy) as an ACP backend in Kiro Crew.
 
 from __future__ import annotations
 
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
 from kiro_crew import acp_backends
-from kiro_crew.acp.adapters.agy import AgyAcpServer
+from kiro_crew.acp.adapters.agy import AgyAcpServer, AgySession
 from kiro_crew.acp.types import PROVIDER_LABEL_AGY, PROVIDER_LABEL_BY_BACKEND
 from kiro_crew.agent_sdk import backends as sdk_backends
 from kiro_crew.agent_sdk import host_auth
@@ -48,8 +51,8 @@ def test_agy_host_auth_declaration() -> None:
     decl = host_auth.declaration_for(AGY)
     assert decl.backend == "agy"
     assert decl.entitlement_source == host_auth.ENTITLEMENT_OWN_CREDENTIAL_FILE
-    assert ".gemini/antigravity-cli/settings.json" in decl.credential_leaves
-    assert ".gemini/antigravity-cli/cache/onboarding.json" in decl.credential_leaves
+    assert decl.credential_leaves == (".gemini/antigravity-cli/cache/onboarding.json",)
+    assert decl.adapter_own_leaves == ()
     assert decl.host_logout_retires_children is False
 
 
@@ -304,3 +307,81 @@ async def test_agy_prompt_tool_unwrapping() -> None:
     ]
     assert len(tool_done) == 1
     assert tool_done[0]["name"] == "mcp__kirocrew-core__send_message"
+
+
+@pytest.mark.asyncio
+async def test_agy_prompt_child_eof_emits_error() -> None:
+    """Prompt handles child EOF before result event by responding with an error."""
+    server = AgyAcpServer()
+    errors: list[tuple[Any, int, str]] = []
+    server._write_error = lambda req_id, code, msg: errors.append((req_id, code, msg))
+
+    mock_proc = MagicMock()
+    mock_proc.returncode = None
+
+    async def fake_wait():
+        mock_proc.returncode = 137
+        return 137
+
+    mock_proc.wait = AsyncMock(side_effect=fake_wait)
+    mock_stdin = MagicMock()
+    mock_stdin.drain = AsyncMock()
+    mock_proc.stdin = mock_stdin
+    mock_stdout = MagicMock()
+    mock_stdout.readline = AsyncMock(return_value=b"")
+    mock_proc.stdout = mock_stdout
+
+    session = AgySession(session_id="test_sess_eof", proc=mock_proc, cwd="/tmp")
+    server.sessions["test_sess_eof"] = session
+
+    await server.dispatch_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 101,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": "test_sess_eof",
+                "prompt": [{"type": "text", "text": "hello"}],
+            },
+        }
+    )
+
+    assert len(errors) == 1
+    assert errors[0][0] == 101
+    assert errors[0][1] == -32000
+    assert "137" in errors[0][2]
+
+
+@pytest.mark.asyncio
+async def test_agy_respawn_failure_emits_error() -> None:
+    """Model/effort option change emits error on respawn failure."""
+    server = AgyAcpServer()
+    errors: list[tuple[Any, int, str]] = []
+    server._write_error = lambda req_id, code, msg: errors.append((req_id, code, msg))
+
+    mock_proc = MagicMock()
+    mock_proc.wait = AsyncMock()
+    session = AgySession(
+        session_id="test_sess_respawn", proc=mock_proc, cwd="/tmp", model="old_model"
+    )
+    server.sessions["test_sess_respawn"] = session
+
+    server._spawn_agy_process = AsyncMock(side_effect=RuntimeError("binary missing"))
+
+    await server.dispatch_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 102,
+            "method": "session/set_config_option",
+            "params": {
+                "sessionId": "test_sess_respawn",
+                "configId": "model",
+                "value": "new_model",
+            },
+        }
+    )
+
+    assert len(errors) == 1
+    assert errors[0][0] == 102
+    assert errors[0][1] == -32000
+    assert "failed to respawn agy process" in errors[0][2]

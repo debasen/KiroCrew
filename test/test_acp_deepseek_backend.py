@@ -1657,7 +1657,7 @@ def test_no_known_backend_is_unverified() -> None:
     # omission.
     from kiro_crew.acp_backends import ACP_BACKEND_ROUTING
 
-    assert set(ACP_BACKEND_ROUTING) >= (ACP_BACKENDS_KNOWN - {ACP_BACKEND_AGY})
+    assert set(ACP_BACKEND_ROUTING) >= ACP_BACKENDS_KNOWN
     # And the shipped baseline carries deepseek:
     assert ACP_BACKEND_DEEPSEEK in set(BASELINE_SELECTABLE_BACKENDS)
 

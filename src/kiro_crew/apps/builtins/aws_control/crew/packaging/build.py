@@ -295,7 +295,6 @@ _SENSITIVE_RELATIVE_DIRS = (
     ".docker/config.json",
     ".dsh/.credentials.yaml",
     ".gemini/antigravity-cli/cache/onboarding.json",
-    ".gemini/antigravity-cli/settings.json",
     ".git-credentials",
     ".gnupg",
     ".gpg",

@@ -698,15 +698,9 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
     ),
     AgentAuthDeclaration(
         backend=ACP_BACKEND_AGY,
-        credential_leaves=(
-            ".gemini/antigravity-cli/settings.json",
-            ".gemini/antigravity-cli/cache/onboarding.json",
-        ),
+        credential_leaves=(".gemini/antigravity-cli/cache/onboarding.json",),
         home_override_env_vars=(),
-        adapter_own_leaves=(
-            ".gemini/antigravity-cli/settings.json",
-            ".gemini/antigravity-cli/cache/onboarding.json",
-        ),
+        adapter_own_leaves=(),
         sign_in_remedy=(
             "Google Antigravity CLI signs in on its own — run agy in a terminal "
             "to complete sign-in. Neither is checked here: the harness reads them."

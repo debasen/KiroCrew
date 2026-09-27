@@ -240,6 +240,8 @@ PREEXEC_EXEMPT: frozenset[str] = frozenset(
 # category breakdown and follow-up hardening candidates.
 BENIGN_SPAWNS: frozenset[str] = frozenset(
     {
+        "acp/adapters/agy.py::_spawn_agy_process",
+        "acp/adapters/agy.py::main",
         "acp/runtime.py::_get_rss_mb",
         # Eight pre-existing spawns in one app's own test module, invisible to this
         # audit until receivers were derived from each file's imports: they are

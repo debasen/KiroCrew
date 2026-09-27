@@ -98,6 +98,10 @@ _MAX_FRAMES = 50
 #: than raising -- so the handshake is unaffected.
 _BACKENDS_WITHOUT_AGENT_VERSION = frozenset({"kas"})
 
+#: Directories whose backend emits no ACP permission-request frame because its
+#: routing is unverified and held in NOT_SHIPPED_SELECTABLE.
+_BACKENDS_WITHOUT_PERMISSION_REQUEST = frozenset({"agy"})
+
 
 # ── the snapshot walk ───────────────────────────────────────────────────────
 
@@ -227,7 +231,10 @@ def test_every_backend_covers_the_required_frame_kinds() -> None:
             gaps.append(f"{name}: no tool_call update")
         if "tool_call_update" not in updates:
             gaps.append(f"{name}: no tool_call_update (tool result) update")
-        if "session/request_permission" not in methods:
+        if (
+            "session/request_permission" not in methods
+            and name not in _BACKENDS_WITHOUT_PERMISSION_REQUEST
+        ):
             gaps.append(f"{name}: no session/request_permission frame")
         if not stop_reasons:
             gaps.append(f"{name}: no end-of-turn response carrying a stopReason")

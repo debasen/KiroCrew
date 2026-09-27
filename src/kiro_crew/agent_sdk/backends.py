@@ -261,6 +261,9 @@ ACP_BACKEND_GOOSE = "goose"
 # closure -- so one global install is the whole precondition, with no workspace
 # checkout and no per-profile dependency step.
 ACP_BACKEND_DEEPSEEK = "deepseek"
+# Google Antigravity CLI reached through its in-tree ACP adapter, ``agy-acp``.
+# The harness executes non-interactively with ``--input-format stream-json --output-format stream-json``.
+ACP_BACKEND_AGY = "agy"
 # The kiro-cli backend is spelled as the empty string throughout, so name it
 # rather than leaving every call site to infer it from "not claude".
 ACP_BACKEND_KIRO = ""
@@ -278,6 +281,7 @@ ACP_BACKENDS_KNOWN: FrozenSet[str] = frozenset(
         ACP_BACKEND_PI,
         ACP_BACKEND_GOOSE,
         ACP_BACKEND_DEEPSEEK,
+        ACP_BACKEND_AGY,
     }
 )
 
@@ -528,6 +532,7 @@ POLICY_ID_BY_BACKEND: dict = {
     ACP_BACKEND_PI: ACP_BACKEND_PI,
     ACP_BACKEND_GOOSE: ACP_BACKEND_GOOSE,
     ACP_BACKEND_DEEPSEEK: ACP_BACKEND_DEEPSEEK,
+    ACP_BACKEND_AGY: ACP_BACKEND_AGY,
 }
 
 #: The backend a deployment policy may never deny.
@@ -1560,6 +1565,7 @@ ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION = frozenset(
         ACP_BACKEND_PI,
         ACP_BACKEND_GOOSE,
         ACP_BACKEND_DEEPSEEK,
+        ACP_BACKEND_AGY,
     }
 )
 
@@ -1592,7 +1598,13 @@ ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION = frozenset(
 # id, ``reasoning_effort``, which ``EFFORT_CONFIG_OPTION_IDS`` below records --
 # membership says the channel exists, the table says what to call it.
 ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION = frozenset(
-    {ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, ACP_BACKEND_DEEPSEEK, ACP_BACKEND_PI}
+    {
+        ACP_BACKEND_CLAUDE,
+        ACP_BACKEND_CODEX,
+        ACP_BACKEND_DEEPSEEK,
+        ACP_BACKEND_PI,
+        ACP_BACKEND_AGY,
+    }
 )
 
 # Backends whose ADVERTISED model ids are ``<model>[<effort>]`` pairs that the
@@ -1895,6 +1907,7 @@ _MODEL_REGISTRY_NAMESPACE_BY_BACKEND: dict = {
     # other harness spells, so a shared bucket would offer the picker ids that only
     # one backend can accept.
     ACP_BACKEND_DEEPSEEK: "deepseek",
+    ACP_BACKEND_AGY: "agy",
 }
 
 
@@ -2090,6 +2103,7 @@ ACP_BACKENDS_HARNESS_OWNED_SESSIONS = frozenset(
         ACP_BACKEND_PI,
         ACP_BACKEND_GOOSE,
         ACP_BACKEND_DEEPSEEK,
+        ACP_BACKEND_AGY,
     }
 )
 
@@ -2112,7 +2126,9 @@ ACP_BACKENDS_HARNESS_OWNED_SESSIONS = frozenset(
 # rejects modes across its whole surface, so it can never return one. Membership is
 # what keeps a restored conversation from being discarded by a check for a block this
 # harness has nothing to put in.
-ACP_BACKENDS_LOAD_WITHOUT_MODES = frozenset({ACP_BACKEND_OPENCODE, ACP_BACKEND_DEEPSEEK})
+ACP_BACKENDS_LOAD_WITHOUT_MODES = frozenset(
+    {ACP_BACKEND_OPENCODE, ACP_BACKEND_DEEPSEEK, ACP_BACKEND_AGY}
+)
 
 # Backends that restore a session with ``session/resume`` instead of
 # ``session/load``, and advertise it under ``sessionCapabilities.resume`` instead of
@@ -2455,6 +2471,15 @@ ACP_BACKEND_LAUNCH: Mapping[str, SelfServedLaunch] = {
             "The ACP plugin package alone does not serve ACP: it is a plugin, and "
             "this binary is the host that boots the profile it lives in."
         ),
+    ),
+    ACP_BACKEND_AGY: SelfServedLaunch(
+        label="Google Antigravity",
+        binary="agy-acp",
+        acp_args=(),
+        bin_env_var="AGY_ACP_BIN",
+        install_command="agy-acp",
+        protocol_version=1,
+        missing_hint="The agy-acp adapter is bundled with kirocrew; ensure agy CLI is also installed.",
     ),
 }
 

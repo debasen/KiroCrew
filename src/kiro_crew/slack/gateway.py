@@ -215,16 +215,19 @@ from kiro_crew.llm_helpers import (
 )
 from kiro_crew.mcp_cron import vet_job_at_fire_time
 from kiro_crew.mcp_gateway import is_gateway_supported
+from kiro_crew.mcp_gateway.launch_approval import (
+    LaunchApprovals,
+    filter_target_env,
+    load_approvals,
+    save_pass,
+)
+from kiro_crew.mcp_gateway.launch_resolve import rewrite_kwargs
 from kiro_crew.mcp_gateway.manager import (
     GatewayManager,
     GatewaySpec,
 )
 from kiro_crew.mcp_gateway.resolve_once import prefetch as resolve_prefetch
-from kiro_crew.mcp_gateway.rewriter import (
-    default_socket_path,
-    resolve_overlay_dir,
-    rewrite_agents,
-)
+from kiro_crew.mcp_gateway.rewriter import rewrite_agents
 from kiro_crew.mcp_hot_reload import parse_kiro_cli_version
 from kiro_crew.memory import MemoryStore
 from kiro_crew.messaging import (
@@ -2075,6 +2078,9 @@ class GatewayOrchestrator:
         self.channel_history: ChannelHistory | None = None
         self.dashboard_state: DashboardState | None = None
         self._background_tasks: set[asyncio.Task] = set()  # prevent GC of fire-and-forget tasks
+        # Approval-state persistence is scheduled while the MCP broker starts,
+        # but its task waits for the dashboard/API readiness boundary.
+        self._mcp_launch_approval_ready = asyncio.Event()
         self._memory_startup: MemoryStartup | None = None
         self._memory_startup_task: asyncio.Task | None = None
         self._memory_repair_task: asyncio.Task | None = None
@@ -6805,7 +6811,7 @@ class GatewayOrchestrator:
                 "AutoNudge: slack session %s unroutable — removing loop %s", key, loop.id
             )
             if self.autonudge_svc and wake_message is None:
-                await self.autonudge_svc.remove(loop.id)
+                await self.autonudge_svc.remove(loop.id, stop_reason="slack_unroutable")
             return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
         if wake_message is None:
             # Snapshot message, sentinel AND config generation TOGETHER, before
@@ -7145,18 +7151,24 @@ class GatewayOrchestrator:
             )
             return _delivery_result(wake_message, MonitorDispatchResult.BUSY)
 
-        async def _retire(reason: str, *args: Any) -> bool | MonitorDispatchResult:
+        async def _retire(
+            stop_reason: str, reason: str, *args: Any
+        ) -> bool | MonitorDispatchResult:
             logger.warning("AutoNudge: " + reason, *args)
             if self.autonudge_svc and wake_message is None:
-                await self.autonudge_svc.remove(loop.id)
+                await self.autonudge_svc.remove(loop.id, stop_reason=stop_reason)
             return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
 
         parts = key.split(":")
         if len(parts) < 4 or parts[2] != "direct":
-            return await _retire("unsupported %s key %s, removing loop %s", channel, key, loop.id)
+            return await _retire(
+                "unsupported_key", "unsupported %s key %s, removing loop %s", channel, key, loop.id
+            )
         principal = parts[3]
         if not adapter.authorize(transport, dispatcher, principal):
-            return await _retire("%s user not authorized, removing loop %s", channel, loop.id)
+            return await _retire(
+                "user_not_authorized", "%s user not authorized, removing loop %s", channel, loop.id
+            )
         try:
             current_key = dispatcher.current_session_key(principal)
         except Exception:
@@ -7174,7 +7186,7 @@ class GatewayOrchestrator:
                 loop.id,
             )
             if self.autonudge_svc and wake_message is None:
-                await self.autonudge_svc.remove(loop.id)
+                await self.autonudge_svc.remove(loop.id, stop_reason="session_rotated")
             return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
         sessions = getattr(dispatcher, "sessions", None)
         if sessions is not None and sessions.is_busy(key):
@@ -7480,7 +7492,9 @@ class GatewayOrchestrator:
                     loop.id,
                 )
                 if wake_message is None:
-                    await self.autonudge_svc.remove(loop.id)  # type: ignore[union-attr]
+                    await self.autonudge_svc.remove(  # type: ignore[union-attr]
+                        loop.id, stop_reason="session_unreachable"
+                    )
                 return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
             logger.info(
                 "AutoNudge: rehydrated session %s from history for loop %s",
@@ -7940,7 +7954,9 @@ class GatewayOrchestrator:
                     loop.slot_key,
                     loop.id,
                 )
-                await self.autonudge_svc.remove(loop.id)  # type: ignore[union-attr]
+                await self.autonudge_svc.remove(  # type: ignore[union-attr]
+                    loop.id, stop_reason="unsupported_channel"
+                )
                 return False
             result = await self._fire_dashboard_nudge(loop)
             assert isinstance(result, bool)
@@ -11725,6 +11741,29 @@ class GatewayOrchestrator:
     # MCP Gateway
     # ------------------------------------------------------------------
 
+    def _schedule_mcp_launch_approval_persist(self, approvals: LaunchApprovals) -> None:
+        """Persist one rewrite pass after the process is ready to serve."""
+        ready = getattr(self, "_mcp_launch_approval_ready", None)
+        if ready is None:
+            ready = asyncio.Event()
+            self._mcp_launch_approval_ready = ready
+
+        async def _persist() -> None:
+            await ready.wait()
+            try:
+                await asyncio.to_thread(save_pass, approvals)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "mcp launch approvals: could not persist the approval store",
+                    exc_info=True,
+                )
+
+        task = asyncio.create_task(_persist(), name="mcp-launch-approval-persist")
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
     async def _init_mcp_gateway(self, stub_servers: frozenset[str] | None = None) -> None:
         """Start the MCP gateway sidecar and populate the agent-JSON overlay.
 
@@ -11754,33 +11793,65 @@ class GatewayOrchestrator:
         if not is_gateway_supported():
             return
 
-        overlay_dir = resolve_overlay_dir(cfg_gw.overlay_dir)
-        socket_path = Path(cfg_gw.socket_path) if cfg_gw.socket_path else default_socket_path()
-        agents_source_dir = kiro_agents_dir()
-        workspace_default = _session_work_dir(None)
+        rewrite_inputs = rewrite_kwargs(self._cfg, stubs)
+        socket_path = rewrite_inputs["socket_path"]
 
         try:
+            # The operator's approved launch fingerprints. The server NAME in
+            # ``stub_servers`` is not proof of what runs: the command behind it
+            # comes from agent-writable files, and gatewayd execs it outside
+            # the sandbox. See ``mcp_gateway.launch_approval``.
+            approvals = await asyncio.to_thread(load_approvals)
+
             # rewrite_agents() walks ~/.kiro/agents, parses every JSON spec and
-            # rewrites the overlay — pure-sync file I/O.  Offload to the bounded
-            # maintenance pool so it can't block the event loop when triggered
-            # post-startup.
-            _rewrite_result, target_env = await asyncio.get_running_loop().run_in_executor(
-                maintenance_executor(),
-                functools.partial(
-                    rewrite_agents,
-                    source_dir=agents_source_dir,
-                    overlay_dir=overlay_dir,
-                    socket_path=socket_path,
-                    work_dir=workspace_default,
-                    sandbox_mode=self._cfg.agent.sandbox,
-                    approval_mode=self._cfg.agent.approval_mode,
-                    stub_servers=stubs,
-                    pooling_enabled=cfg_gw.enabled,
-                ),
+            # rewrites the overlay — pure-sync file I/O. The target filter is
+            # the last gateway-side stop before that map becomes gatewayd's
+            # process env. Run both through one bounded maintenance-pool job so
+            # neither blocks the event loop when triggered post-startup.
+            def _rewrite_and_filter():
+                rewrite_result, target_env = rewrite_agents(
+                    **rewrite_inputs,
+                    approvals=approvals,
+                )
+                target_env, dropped_targets = filter_target_env(target_env, approvals)
+                return rewrite_result, target_env, dropped_targets
+
+            (
+                _rewrite_result,
+                target_env,
+                dropped_targets,
+            ) = await asyncio.get_running_loop().run_in_executor(
+                maintenance_executor(), _rewrite_and_filter
             )
         except Exception:
             logger.exception("mcp-gateway rewriter failed — falling back")
             return
+        if dropped_targets:
+            logger.warning(
+                "mcp launch approvals: withheld %d unapproved target(s) from the gateway daemon",
+                len(dropped_targets),
+            )
+        if approvals.refused:
+            logger.warning(
+                "mcp launch approvals: %d server launch(es) refused; review them in "
+                "Settings > MCP Management",
+                len(approvals.refused),
+            )
+        if approvals.captured or approvals.refused:
+            # Names and counts only; a launch's args and env may carry tokens.
+            try:
+                sel().log_api_access(
+                    caller="gateway",
+                    operation="mcp_launch_approval",
+                    outcome="denied" if approvals.refused else "recorded",
+                    source="gateway",
+                    resources=(
+                        f"recorded={','.join(sorted(approvals.names.get(s, s) for s in approvals.captured))} "
+                        f"refused={','.join(sorted(approvals.names.get(s, s) for s in approvals.refused))}"
+                    ),
+                )
+            except Exception:
+                logger.debug("mcp launch approvals: SEL write failed", exc_info=True)
 
         manager = GatewayManager(
             GatewaySpec(
@@ -11812,6 +11883,10 @@ class GatewayOrchestrator:
         )
         if await manager.start():
             self._mcp_gateway_manager = manager
+            # Admission already uses the in-memory, fail-closed filtered map.
+            # Persistence waits for the process readiness boundary and cannot
+            # extend the boot path.
+            self._schedule_mcp_launch_approval_persist(approvals)
             # Report the stub set and the sharing decision. There is one
             # trigger now (something is stubbed), so the useful line is WHAT it
             # serves: "N routed" beside a live daemon explains itself, and the
@@ -13528,10 +13603,16 @@ class GatewayOrchestrator:
             logger.warning("Auto-update failed", exc_info=True)
             if self.dashboard_state:
                 # Surface the platform-correct manual restart command so a failed
-                # auto-restart doesn't leave the user guessing.
-                self.dashboard_state.push_update_progress(
-                    "failed", f"Restart failed — run: {restart_command_hint()}"
-                )
+                # auto-restart doesn't leave the user guessing. Resolved OFF the
+                # loop thread: the hint stats the two unit-file locations, and
+                # the per-user one is under the account's home, which can be a
+                # network mount — a stat against a disconnected mount blocks for
+                # as long as the mount does, and on this thread that freezes
+                # chat and the liveness heartbeat together with nothing in-band
+                # to clear it (the watchdog's kill is the only exit). A worker
+                # thread waits in its place; the loop keeps serving.
+                hint = await asyncio.to_thread(restart_command_hint)
+                self.dashboard_state.push_update_progress("failed", f"Restart failed — run: {hint}")
 
     async def _auto_apply_wheel_update(self) -> None:
         """Auto-apply a wheel/cli.sh update by re-running the signed installer.
@@ -14015,6 +14096,12 @@ class GatewayOrchestrator:
                 "home": str(data_home()),
             }
             print(f"KIROCREW_READY:{json.dumps(ready_payload)}", flush=True)
+
+        # The HTTP socket is bound, and the optional machine-readable marker
+        # has been emitted. Background approval-state writes may start now.
+        approval_ready = getattr(self, "_mcp_launch_approval_ready", None)
+        if approval_ready is not None:
+            approval_ready.set()
 
         self._install_shutdown_signal_handlers()
 

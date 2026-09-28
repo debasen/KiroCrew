@@ -871,7 +871,7 @@ SQLite table `semantic_memory` — structured key-value store with:
 - **Key format**: `^[a-z][a-z0-9_.]*[a-z0-9]$`, max 100 chars; value JSON max 4,096 bytes. The lower bound is a decoded one: a value that is null, empty, or only whitespace is refused as `VALUE_EMPTY`, so no row can hold a value that reads as absent.
 - **Confidence gating**: writes whose source is not `user_explicit` require confidence ≥ `_DEFAULT_CONFIDENCE_THRESHOLD` (0.8); `user_explicit` bypasses the threshold
 - **V1 conflict resolution**: `user_explicit` replaces an existing value; an automated source cannot replace an active user-explicit fact, unless the stored value is itself degenerate (null, empty, or only whitespace) — that row holds nothing for precedence to protect, and only an automated writer would ever repair it, so such a write is allowed and logged. Otherwise higher confidence wins, or the newer value wins when the confidence difference is less than 0.1. Tombstones can be recreated. V1 consolidation retains direct stale-key deletion and its semantic prompt, while extracted lessons keep their automatic consolidation source. An LLM confidence claim is not user evidence. Reaffirmation still refreshes confidence/source and reaches the original embedding and retirement paths. Owner edits retain shared revision checks. A rejected write logs a best-effort `conflict_skip` event; an unavailable event log does not prevent a V1 data write.
-- **Injection detection**: the `_INJECTION_PATTERNS` regex set (14 patterns, `vector_memory_constants.py`) is scanned on every value write
+- **Injection detection**: the `_INJECTION_PATTERNS` regex set (`vector_memory_constants.py`) is scanned on every value write
 - **Write-time embedding**: `_write_semantic()` embeds `"<key> <value_json>"` after the upsert (outside `_db_lock`, at `PRIORITY_BULK` — nothing blocks on it and the tail is reached from consolidation/import loops; same space-generation contract as `write_lesson`) and persists the struct-packed, un-normalized vector into the row's `embedding` column. The upsert's conflict clause keeps the stored vector when the value is unchanged (a re-affirmation — the tail then skips the redundant embed) and clears it when the value changed, so a row never ranks by a vector for text it no longer holds. `lesson.*` keys are excluded (`write_lesson` owns their vector — raw rule text). `set_semantic_if_absent()` (bulk import) defers embedding to the backfill sweep, like `write_episodic(defer_embedding=True)`. Rows missed while the model was absent — plus rows cleared by `reconcile_embedding_space()` — are repaired by `_backfill_semantic_kv_embeddings()` inside `backfill_missing_embeddings()`.
 - **Audit trail**: `memory_events` table logs every create/update/delete with old+new values, bounded at `_MAX_EVENTS = 10_000`. The dashboard events API recursively redacts credentials and unsafe URLs on response for Global V1, named V1 and private V2. Stored events and their identities remain unchanged.
 
@@ -1310,7 +1310,24 @@ unbounded archival memory.
 
 Admitted project essentials are the active project's root `AGENTS.md` and
 `SOUL.md`, default/`always` documents under `.kiro/steering`, and Markdown file
-resources explicitly declared by the template. Native `manual`, `auto` and
+resources explicitly declared by the template. The global `~/.kiro/steering`
+always documents, the root `AGENTS.md` and undeclared `.kiro/steering`
+documents are kiro-cli default resources: when kiro-cli serves the session and
+`chat.disableInheritingDefaultResources` opts the workspace out, the snapshot
+omits them and keeps the prompt, the declared resources and `SOUL.md`, which is
+Crew's own file rather than a kiro-cli default. The verdict is computed once
+per normal turn, where the harness is known, and handed to the snapshot and the
+folder-steering dedup; no consumer reads the setting itself, and on any other
+harness the member keeps inheriting because a kiro-cli setting changes nothing
+there. A profile validation pass does not read the setting and instead measures
+the inheriting envelope, which is the largest envelope any harness can build.
+The preference comes from the skill projection's decision (see
+[ACP client](acp-client.md)), so Crew's overlay on that key never reads as an
+opt-out; settings that cannot be read keep inheritance. A non-member kiro-cli
+chat follows the same decision: in an opted-out workspace a folder that
+declares the project's or the global `.kiro/steering` root carries those
+always documents itself, at session start and after a compaction, instead of
+skipping them as already delivered. Native `manual`, `auto` and
 `fileMatch` steering retain their trigger semantics. A custom template's
 declared prompt may be inline or a file source. Missing optional root files
 are allowed; an unreadable declared source or malformed/shadowed template
@@ -2977,6 +2994,12 @@ ancestor and unlink identity checks degrade to by-name checks. Setup and gateway
 startup both invoke it; startup runs it on every boot so a package upgrade needs
 no separate setup command.
 
+Agent skill-path discovery also scans nested AIM package snapshots under the
+per-package snapshot tree. A valid object version manifest with `currentEventId`
+selects that snapshot. Malformed JSON or a non-object manifest has no selected
+event and follows the existing fallback of scanning nested snapshots; it does not
+abort agent configuration.
+
 **Project skills (`<project>/.kiro/skills`) — a different source from the one above.**
 `$KIROCREW_PROJECT_DIR/skills/` is a *sync* source: its contents are copied into
 `~/.kiro/crew/skills/` and thereafter are ordinary local skills. `<project>/.kiro/skills`
@@ -4380,6 +4403,37 @@ Prompt keys are only appended when ALL hold:
 Auto-generated skills live under `~/.kiro/crew/skills/auto/<slug>/SKILL.md`. Slug validated against `^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$`. The `auto/` prefix:
 - Makes provenance visible without parsing frontmatter (`list_auto_skills()`)
 - Prevents accidental overwrite of hand-authored skills via the refine path (`update_auto_skill()` explicitly refuses names outside `auto/`)
+
+### One slug space, one allocator
+
+The live tree `auto/<slug>` and the pending queue `auto/.pending/<slug>` are two halves of ONE name space, because a queued NEW candidate's promotion destination IS `auto/<slug>`. A claim that consults only its own half can take a name the other half depends on, and the losing side goes silently: `approve_pending_skill` refuses a candidate whose live name is occupied (`live_exists`) for as long as that directory stands, TTL pruning then deletes it unreviewed, and consolidation advances its message offset whatever one candidate's outcome, so nothing is retried from the same sessions.
+
+**The invariant: the three AUTO-SKILL allocators test availability with `_auto_slug_available` while holding `_auto_slug_claim_lock`.** They are `create_auto_skill` (live publish), `stage_skill_candidate` (queue a candidate), and `restore_auto_skill` (move an archived skill back live). A new allocator in this pipeline MUST route through the same pair rather than checking a directory itself.
+
+Two writers reach `auto/` WITHOUT that coordination, and both are known gaps rather than covered cases:
+
+- The `crystallize` builtin skill stages `auto/.pending/<slug>` with raw file tools instead of calling `stage_skill_candidate`, so it can write a pending directory after a live claim already stands. Approval then refuses that candidate for `live_exists` and TTL pruning deletes it unarchived. Closing this means giving crystallize a host path that calls `stage_skill_candidate`, not adding another direct-write guard.
+- `create_skill` accepts any name, including an `auto/`-prefixed one, from the dashboard prompt and discover handlers (`READONLY_SKILL_KEY_PREFIXES` does not exclude `auto/`), so a hand-created `auto/<slug>` can strand a queued candidate through the same `live_exists` refusal. Closing this means refusing or routing `auto/`-prefixed names at those call sites.
+
+`_auto_slug_available(slug, claim=...)` answers for the claim actually being made, because the halves are not symmetric:
+
+| `claim` | Free when |
+|---|---|
+| `live` | `auto/<slug>` absent AND no pending NEW candidate under that slug |
+| `pending-new` | `auto/.pending/<slug>` absent AND `auto/<slug>` unoccupied (a queued candidate whose live name is taken is unapprovable) |
+| `pending-update` | `auto/.pending/<slug>` absent; the live tree does not constrain it |
+
+An UPDATE candidate is queued under `<target-slug>-update` and `approve_pending_update` promotes it over the live `target` in its metadata, never consulting `auto/<candidate-slug>`, so it reserves nothing in the live tree. The `live` test reads the queued candidate's `kind` to tell the two apart and FAILS CLOSED: metadata that is missing, unreadable, or silent about `kind` keeps the slug reserved. Staging therefore holds the lock until `.meta.json` is committed, since `kind` is the field a concurrent publish reads.
+
+`_auto_slug_claim_lock` is an advisory exclusive lock on `skills/.auto-slug-claim.lock` — a dot-prefixed plain file at the skills root, skipped by discovery, placed outside `auto/` so taking it does not create the auto namespace as a side effect of a refused claim. It yields whether the lock was ACQUIRED, and an unacquired lock is a REFUSAL: opening the file can fail on a read-only home, and the acquire can lose within its seconds-long ceiling. Each namespace's claim is additionally an atomic `mkdir(exist_ok=False)`, so a claim lost to a concurrent writer refuses instead of overwriting, but `mkdir` alone cannot make the cross-namespace pair safe because the two paths create different directories.
+
+**Both claim paths return `None` rather than raising or half-succeeding.** `stage_skill_candidate` returns `None` when nothing is queued: an invalid slug, an oversized procedure, an unacquired lock, or no free name across `<slug>` and siblings `<slug>-2..-50`. A `None` means the candidate is NOT on disk and the caller MUST take its rejection branch, because a name returned from a path that wrote nothing is recorded as a staged candidate that does not exist, and the offset advance makes that loss permanent and invisible. `create_auto_skill` and `restore_auto_skill` likewise answer `None` on refusal, which their callers audit as a rejection.
+
+**One of those refusals is transient, and only that one is retried.** An invalid slug, an oversized procedure and an exhausted sibling walk are properties of the CANDIDATE: refused once, refused forever. An unacquired claim lock is a property of the MOMENT. A caller reading a bare `None` cannot tell them apart, so a claim path also fills in a `ClaimRefusal` when one is supplied, setting `retryable` for the lock case alone.
+
+Skill detection is what acts on it. It records a `(rotation_generation, message_count)` marker per session BEFORE staging runs and skips a pass whose pair is unchanged, so a stall would otherwise cost the candidate until a further message changed the count or a gateway restart cleared the marker — a session that goes quiet right after the stall loses it. On a `retryable` refusal the pass RETRACTS its own marker, so the next consolidation re-judges the same unchanged session and reaches the claim with the lock free.
+
+**The shared consolidation offset is deliberately left advanced.** History, semantic and lesson extraction all consume it, so rewinding it to re-attempt one skill candidate would re-summarize an already-consolidated tail into duplicate entries — which is why skill detection reads the last `_SKILL_DETECTION_WINDOW` messages of the whole session and was decoupled from that offset in the first place. The marker is the only state the retry rewinds.
 
 ### Provenance (`AutoSkillProvenance`)
 

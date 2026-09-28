@@ -164,6 +164,7 @@ from kiro_crew.metrics.events import SESSION_IDLE_EXPIRED, emit_counter
 from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.providers.base import CancelOutcome, LLMProvider
 from kiro_crew.pycache_gc import PYCACHE_GC_INTERVAL_SECS, prune_pycache
+from kiro_crew.runtime_ownership import PidRefcount
 from kiro_crew.sandbox import cleanup_stale_sandbox_profiles
 from kiro_crew.sel import sel
 from kiro_crew.session_allocation import (
@@ -1572,11 +1573,11 @@ class SessionManager:
         self._registry_state().start_sem = value
 
     @property
-    def _starting_pids(self) -> set[int]:
+    def _starting_pids(self) -> PidRefcount:
         return self._registry_state().starting_pids
 
     @_starting_pids.setter
-    def _starting_pids(self, value: set[int]) -> None:
+    def _starting_pids(self, value: PidRefcount) -> None:
         self._registry_state().starting_pids = value
 
     @property
@@ -3255,6 +3256,14 @@ class SessionManager:
         """True iff this session's mirror is a session-resume (two-way) binding."""
         return self._session_map.mirror_accepts_inbound(key)
 
+    def mirror_link_nonce(self, key: str) -> str:
+        """The per-binding nonce of the mirror ``get_mirror_link`` returns (``""`` for none)."""
+        return self._session_map.mirror_link_nonce(key)
+
+    def slack_link_nonce(self, key: str) -> str:
+        """The per-binding nonce of the Slack thread ``get_slack_link`` returns (``""`` for none)."""
+        return self._session_map.slack_link_nonce(key)
+
     def set_mirror_opt_out(self, key: str, opted_out: bool) -> None:
         """Record (or withdraw) a refusal of AUTOMATIC origin mirroring.
 
@@ -3368,6 +3377,30 @@ class SessionManager:
     def clear_mirror_link(self, key: str, *, reason: str = UNBIND_REASON_UNSPECIFIED) -> bool:
         """Remove a session's outbound mirror binding. Returns True iff present."""
         return self._session_map.clear_mirror_link(key, reason=reason)
+
+    def clear_mirror_link_if(
+        self,
+        key: str,
+        channel_type: str,
+        token: str,
+        *,
+        reason: str = UNBIND_REASON_UNSPECIFIED,
+    ) -> bool:
+        """Clear the mirror iff it is the binding ``(channel_type, token)`` names.
+
+        The compare and the clear are one step under the map's lock; False is a
+        mismatch (or no binding) and nothing was touched. The only way an unlink
+        that names a row clears it -- see ``SessionMap.clear_mirror_link_if``.
+        """
+        return self._session_map.clear_mirror_link_if(key, channel_type, token, reason=reason)
+
+    def clear_slack_link_if(self, key: str, channel_type: str, token: str) -> bool:
+        """Clear the Slack thread iff it is the binding ``(channel_type, token)`` names.
+
+        The Slack twin of ``clear_mirror_link_if``; both key spellings of a
+        dashboard session go in the same step.
+        """
+        return self._session_map.clear_slack_link_if(key, channel_type, token)
 
     def clear_mirror_links_at(
         self, link: ChannelLink, *, reason: str = UNBIND_REASON_UNSPECIFIED

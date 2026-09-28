@@ -137,6 +137,7 @@ from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.effort import EFFORT_LEVELS, EFFORT_VALUES
 from kiro_crew.executors import discovery_executor, maintenance_executor, subprocess_executor
 from kiro_crew.external_text import redact_external_text as _redact_external
+from kiro_crew.kiro_prerequisite import spawn_supervised_oneshot
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.members import MemberNameError, validate_member_name
 from kiro_crew.memory_stores import (
@@ -150,12 +151,11 @@ from kiro_crew.memory_stores import (
     retire_unpublished_allocation,
 )
 from kiro_crew.platform.governance import sanitize_agent_config_governance
-from kiro_crew.platform_compat import is_link_or_junction
+from kiro_crew.platform_compat import is_link_or_junction, kill_and_reap
 from kiro_crew.sandbox import (
     SandboxUnavailableError,
     cgroup_scope_argv,
     configured_sandbox_mode,
-    create_subprocess_limited,
     scrub_agent_subprocess_env,
     wrap_argv,
 )
@@ -2403,11 +2403,15 @@ async def api_models(request: web.Request) -> web.Response:
             # the protected .env read off the gateway loop.
             await asyncio.to_thread(inject_kiro_cli_api_key, env)
             env = scrub_agent_subprocess_env(env)
-            proc = await create_subprocess_limited(
-                *argv,
+            # Supervised so the call ends whatever it leaves behind. A kiro-cli
+            # launcher wrapper can start a ~140-thread credential helper for each
+            # call and leave it running; this endpoint re-polls every 8s while
+            # degraded, so on a gateway on that path every poll leaked one until
+            # the agent cgroup ran out of pids.
+            proc = await spawn_supervised_oneshot(
+                argv,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                start_new_session=True,
                 env=env,
             )
             try:
@@ -2415,11 +2419,9 @@ async def api_models(request: web.Request) -> web.Response:
                     proc.communicate(), timeout=_LIST_MODELS_SUBPROCESS_TIMEOUT_SECS
                 )
             except asyncio.TimeoutError:
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-                await proc.communicate()
+                # The whole group, while the supervisor still leads it: killing
+                # only the leader would leave the command and its helpers running.
+                await kill_and_reap(proc)
                 # A cold CLI spawn exceeded the timeout. This is the common
                 # cause of the "picker is empty until I refresh" symptom: a
                 # slow first `--list-models` spawn returning [] (HTTP 200) would
@@ -4821,7 +4823,37 @@ def _crew_memory_store_rejected(raw: object) -> str | None:
     )
 
 
-def _model_pin_rejected(model: str, request: web.Request, provider: str) -> str | None:
+def _pin_entitlement_backend(cfg: Any) -> str:
+    """The harness whose live catalog may judge a crew's model pin.
+
+    Every agent created or updated here is a Crew Member whose DM slot
+    (``member-<slug>``) routes through ``agent.member_acp_backend`` — not
+    through the configured default harness ``agent.acp_backend``. When the two
+    share a model-registry namespace, the default backend scopes the
+    entitlement evidence correctly (kiro, including the empty default backend,
+    and kas share ``acp``). When they do not, the default's catalog cannot
+    establish whether the pin the DM thread will actually run is usable — a
+    live kiro session's catalog would deterministically reject a
+    claude-advertised id — so the evidence must come from the harness the DM
+    thread will ACTUALLY run on, which is ``member_backend``. Returning it (not
+    ``None``) keeps the scope on the member's own namespace: a provider from an
+    unrelated harness can neither admit nor reject the pin, and when no member
+    -namespace provider is live the catalog is simply unknown (fail-open) rather
+    than judged by the wrong backend's advertised ids.
+    """
+    default_backend = getattr(cfg.agent, "acp_backend", "")
+    member_backend = getattr(cfg.agent, "member_acp_backend", "")
+    if (
+        capabilities_for(member_backend).model_id_namespace
+        != capabilities_for(default_backend).model_id_namespace
+    ):
+        return member_backend
+    return default_backend
+
+
+def _model_pin_rejected(
+    model: str, request: web.Request, provider: str, *, backend: str | None = None
+) -> str | None:
     """Reason a crew's model pin is unusable, or ``None`` to allow it.
 
     An agent's ``model`` is read by kiro-cli when the child starts, so a pin the
@@ -4876,7 +4908,7 @@ def _model_pin_rejected(model: str, request: web.Request, provider: str) -> str 
     # so importing it at module scope would close the cycle.
     from kiro_crew.dashboard.handlers.core import _validate_role_model
 
-    return _validate_role_model(model, request, provider=provider)
+    return _validate_role_model(model, request, provider=provider, backend=backend)
 
 
 async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
@@ -5055,7 +5087,9 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": f"Agent '{name}' already exists", "code": "agent_exists"}, status=409
             )
-        model_reason = _model_pin_rejected(model, request, cfg.agent.provider)
+        model_reason = _model_pin_rejected(
+            model, request, cfg.agent.provider, backend=_pin_entitlement_backend(cfg)
+        )
         if model_reason:
             return web.json_response({"error": model_reason, "code": "invalid_model"}, status=400)
         # Checked INSIDE the config lock, immediately before the binding is
@@ -5334,7 +5368,12 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
         if "model" in body:
             # Validated before the write, reusing the config loaded just above so
             # this costs no extra read.
-            model_reason = _model_pin_rejected(pending_model, request, cfg.agent.provider)
+            model_reason = _model_pin_rejected(
+                pending_model,
+                request,
+                cfg.agent.provider,
+                backend=_pin_entitlement_backend(cfg),
+            )
             if model_reason:
                 return web.json_response(
                     {"error": model_reason, "code": "invalid_model"}, status=400

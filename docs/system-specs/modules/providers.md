@@ -162,7 +162,12 @@ Kiro's supported `--agent` prompt/resources contract, not a per-file model recei
 Changes to a launch-version source receive a complete manual replacement.
 Kiro's implicit workspace-root AGENTS and default/always steering in project and
 global steering directories also belong to that launch contract, even when no
-resource glob declares them. SOUL is native-owned only when explicitly declared.
+resource glob declares them, while the workspace inherits kiro-cli's default
+resources; an opted-out workspace's contract is its declared sources alone. The
+opt-out is kiro-cli's own setting, so it applies only when kiro-cli serves the
+session: every other harness keeps the inheriting contract, and the non-member
+folder-steering dedup follows the same decision.
+SOUL is native-owned only when explicitly declared.
 The mirrored steering reference records engine/version differences for conditional
 modes, so Kiro uses the fallback selector instead of claiming full native support.
 
@@ -176,11 +181,12 @@ the harnesses carry no folder-steering field, so every harness produces an
 identical `SpawnPlan` for a folder chat and a non-folder chat; delivery cannot be
 lost by adding a provider. A file whose realpath lies under the chat project's
 `.kiro/steering` or under `~/.kiro/steering` is skipped ONLY where the active provider
-already delivers those trees -- kiro-cli loads them natively, the Claude Code seam
-receives the explicit steering load, KAS reports `native_steering` -- so they are
-not sent twice; on a harness with no such path (Codex, OpenCode, Pi, Goose,
-DeepSeek) the folder delivers them like any other document rather than skipping
-rules nothing else would carry. Documents honor the steering
+already delivers those trees -- kiro-cli loads them natively while the workspace
+inherits kiro-cli's default resources, the Claude Code seam receives the explicit
+steering load, KAS reports `native_steering` -- so they are not sent twice; on a
+harness with no such path (Codex, OpenCode, Pi, Goose, DeepSeek) the folder
+delivers them like any other document rather than skipping rules nothing else
+would carry. Documents honor the steering
 `inclusion` frontmatter (`always`, or absent, is included; `manual`, `auto` and
 `fileMatch` are skipped and left to their native trigger), and each file is
 admitted against its own declared directory as the trust base, so a symlink can
@@ -349,7 +355,7 @@ harness can get wrong:
 | Member | Contract |
 |---|---|
 | `start` / `shutdown` / `stream` | The turn lifecycle every consumer depends on. |
-| `approve_tool` / `reject_tool` | Tool-approval responses; a provider that cannot answer must still refuse, never hang. |
+| `approve_tool` / `reject_tool` | Tool-approval responses; `approve_tool` returns whether an allow answer was sent, and a provider that cannot answer must still refuse, never hang. |
 | `context_usage_pct`, `context_usage_unknown`, `context_window_tokens`, `context_used_tokens` | The context meter. `context_usage_unknown` is what distinguishes "0%" from "not measured". |
 | `session_id`, `cleanup_session`, `cwd` | Session identity and cleanup routing; a wrong `cwd` persists the wrong workspace on resume. |
 | `served_model`, `available_models` | The model actually served, which can differ from the id Crew stored. |
@@ -658,3 +664,22 @@ Native Kiro CLI spawning also prepares a bounded skill discovery view, shared by
 the direct client and runtime. Its workspace settings suppress implicit native skill
 inheritance; authored mappings stay available to Crew scoped search/list/read.
 See [ACP client](acp-client.md#native-skill-startup-views).
+
+### Codex dashboard session mount
+
+For an agent explicitly granted `kirocrew-dashboard`, the Codex mirror rebuilds
+its direct launch from the gateway-managed entry and injects that session's
+identity. Both creation and resume use this projection. The Codex harness sets
+`DISABLE_MCP_CONFIG_FILTERING=true`: codex-acp otherwise drops a session entry
+when global Codex configuration declares the same name, leaving an unbound
+server in place of the verified mount. Spec-selected launchers
+never receive that identity. Disabled, ungranted and per-tool-restricted dashboard
+servers remain withheld. A granted gateway broker stub is also admitted through
+the same restriction checks; gatewayd verifies its claim and supplies per-call
+identity to the managed backend.
+
+On an enforced sandbox, credential-bearing host readers need the broker route:
+configure `mcp_gateway.stub_servers` to include `kirocrew-core` and
+`kirocrew-dashboard`. Direct children cannot read the gateway credential or SEL
+trust root there; the patch does not relax those masks. Global Codex MCP entries
+are not a substitute for this session mount.

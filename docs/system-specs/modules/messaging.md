@@ -2060,6 +2060,37 @@ another chat's surface is answering that chat's messages, and writing it here wo
 quote their text; nothing is stranded by staying silent, because those messages are
 still queued, which is why the entry goes back LIVE rather than being dropped.
 
+A flip addressed to the bubble has a SECOND condition before it retires the key, and it
+is the partial stop's condition asked at the other transition: while a line belonging to
+ANOTHER principal is still listed at the bubble's own address, the bubble is re-rendered
+as `⏳ Queued` over what remains and the entry stays LIVE. A shared ADDRESS makes this
+ordinary rather than an edge -- a group space gives every member one session key and one
+receipt address, so both members' lines sit on the one bubble and the flip is addressed
+by either of them -- while the drain still answers ONE principal per turn. Retiring the
+key there wrote `▶️ Now answering (1)` over a list of two: an acknowledgement erased for
+a message still on the queue, and then no record for it at all, because that entry was
+its only handle and its own later drain finds nothing to flip. So the flip is told WHOSE
+messages it answered (the same owner token the queue entries carry) and takes only those
+lines off the list; every drain passes it, pinned by a source check, because a channel
+wired up later cannot be covered by a behavioural test written now. It is told HOW MANY of
+that principal's the drain put back as well, and keeps their newest that many rather than
+dropping as many lines as it answered texts: a queued message does not always open a line
+here -- a refused `send_receipt` opens no bubble at all, and a message arriving while the
+entry owes a record is not retained -- so a principal can hold fewer lines than they have
+messages queued, and a positional count would then consume a line whose message is still
+queued, which is the erasure this whole condition exists to prevent. Counting from the
+newest end is what makes the two numbers unable to disagree, and where it is still
+ambiguous it keeps: a line left listed is re-rendered by the next transition, a line
+removed is gone. A refused re-render owes no record, exactly as a refused grow does not:
+those messages have not left the queue.
+
+Two remainders deliberately do NOT hold the bubble. A line at another ADDRESS was never
+rendered on it, so it is owed nothing and is excluded by the same `texts_at_address`
+every body here is built from. And the answered principal's OWN messages past the
+collapse cap are answered by that same principal's very next drain, which the flip body
+already states as `+N deferred` -- so that contract stands unchanged, and the third
+category is named in `others_at_address` rather than left implicit.
+
 A **grow** from another conversation is the one case with no correct address at all.
 The bubble's chat would receive this sender's text, which this module has always
 refused; this sender's own chat holds no bubble, so the per-chat `msg_id` names an
@@ -2593,7 +2624,7 @@ answer is not permission: a raised evaluation and a `Decision` without
 - **A media-only inbound message is a message**: a transport whose text extraction comes back empty may only drop the envelope when there are also no media items. Weixin previously returned early on empty text, so an uncaptioned screenshot was discarded with no reply and no log line — the sender saw a successful send while the agent was never told anything arrived. Emptiness is a reason to drop only when the whole envelope is empty.
 - **Unknown formats remain passive and complete**: `messaging/attachments.py` preserves video and unrecognized formats as byte-identical, randomized temporary files, supplies their local paths and original metadata to the agent, and transfers cleanup ownership through the current or queued turn. Opaque bytes are never automatically parsed, extracted, or executed; an inlineable image suffix is stripped from the temporary path so the suffix-typed ACP image sink cannot claim them, and any later tool access still crosses the normal permission and hook boundaries.
 - **Weixin inbound media is CDN-indirect**: iLink envelopes never carry bytes, only a `CDNMedia` reference (`encrypt_query_param` + `aes_key`) whose object is AES-128-ECB encrypted on the WeChat CDN. `weixin/media.py` owns that protocol work (URL construction with percent-encoded params, key decoding, decrypt, a streaming size cap enforced on bytes read rather than `Content-Length`); `weixin/attachments.py` maps the four CDN-backed item types onto the shared `Attachment` and hands them to `messaging/attachments.py`, which keeps classification, limits, signature validation and temp-file ownership channel-neutral. The `aes_key` field carries **two** encodings for the same value — `base64(raw 16 bytes)` for images, `base64(ascii hex)` for file/voice/video — discriminated by decoded length plus a strict hex check, because guessing wrong yields plausible garbage rather than an error. A voice item that already carries server-side `text` short-circuits the download: iLink voice is SILK, which no shipped transcription backend decodes, so the local path is strictly worse than the transcript the server gave us. `files_inbound=True` reflects this; `files_outbound` stays `False` until the `getuploadurl` + encrypted CDN PUT half lands.
-- **A mid-turn queue receipt is edited, never deleted**: it flips in place to `▶️ Now answering` on drain and to `🛑 Cancelled` on `/stop`. It is the durable record that a held message was accepted, so no path may delete it. A caller-scoped `/stop` withdraws that caller's OWN lines from the record, drops the registry entry, and writes `🛑 Cancelled` over those lines only when the caller is the principal who OPENED the bubble -- otherwise `msg_id` names a message in somebody else's conversation. The entry may not survive: a drain flips using the chat of the entry it answers, so a surviving entry whose opener has stopped would hand it an id minted in another chat and overwrite an unrelated message there.
+- **A mid-turn queue receipt is edited, never deleted**: it flips in place to `▶️ Now answering` on drain and to `🛑 Cancelled` on `/stop`. It is the durable record that a held message was accepted, so no path may delete it. A caller-scoped `/stop` withdraws that caller's OWN lines from the record, drops the registry entry, and writes `🛑 Cancelled` over those lines only when the caller is the principal who OPENED the bubble -- otherwise `msg_id` names a message in somebody else's conversation. The entry may not survive: a drain flips using the chat of the entry it answers, so a surviving entry whose opener has stopped would hand it an id minted in another chat and overwrite an unrelated message there. Both terminal transitions are preceded by the same condition, which is about neither addressing nor who is calling: while ANOTHER principal's line is still listed at the bubble's own address, nothing terminal is written and the entry stays LIVE -- the stop writes nothing at all, and the drain re-renders `⏳ Queued` over what remains -- because that entry is the only handle those still-queued messages have.
 - **A queued burst drains as ONE turn, under ONE envelope taken from the messages**: `_drain_queue` joins the held texts in arrival order into a single combined turn (capped by `_MAX_COLLAPSE` and, on Discord, the attachment ingest limit), never N replayed turns. Anything past a cap is re-enqueued together with everything behind it so FIFO order stays exact. Because `dm_scope = "unified"` can fold several people onto one queue, every queue-carrying channel records a per-entry origin, collapses only entries sharing a sender and a place, and replays from the first entry's origin -- grouping on sender and place, never on a per-message id, which would stop the collapse altogether. Beside that origin every entry also records a neutral `queued_owner`, read off the same sender key, which is what lets `/stop` drop one person's queued messages and leave everybody else's. A deferred entry is re-enqueued WITH its origin, or it would inherit the next first entry's identity one iteration later. An entry recorded by ANOTHER transport sharing that queue is set aside and its owner's drain is woken (`messaging/queue_drain.py`), because setting aside an already-receipted message without waking anyone leaves it unanswered until that transport next speaks.
 - **A mid-turn steer requires a genuinely live turn**: gate on `provider.has_active_turn()`, never on `sessions.is_busy()` alone, which stays true through post-turn bookkeeping. Steering an ended prompt is silently swallowed, producing an acknowledgement with no answer.
 - **Cancel is cooperative before it is fatal**: `/stop` sends the ACP `session/cancel` notification and lets the turn stop at its next safe point; escalation to a hard kill happens only after the soft-stop budget elapses without an ack. On a shared runtime the cooperative path is the only one that cannot take a co-tenant down with it.
@@ -2630,7 +2661,7 @@ answer is not permission: a raised evaluation and a `Decision` without
 - **The proactive PRODUCERS started Slack-shaped, and the parity claim tracks how far that has moved**: `api_send_message` (the LLM-facing `send_message` tool) began with exactly two legs — the origin dashboard slot and `state.slack_client` — and `file_send` still posts to the Slack upload route. The tool's own explicit addressing now exists for every registered channel and does consult `state.channel_transports`: `channel_type` (+ optional `target_id`) for the conversation the session belongs to, and `session="<channel>"` for that channel's configured owner. See § Proactive sends. What remains Slack-only is the shape of `channel`/`user`/`thread_ts`, whose allow-list and threading semantics are Slack concepts, and `file_send`'s upload route. The `unfurl_*` fields are Slack-shaped too but are no longer live send semantics: they are refused, not forwarded (see the preview invariant above). For a Slack-linked `file_send`, the native document-channel leg has no destination; its routine skip is omitted from the tool result, while a successful Slack upload is reported explicitly for every resolved identity (the endpoint answers ok-without-`skipped` only on delivery). A cron result also still reaches a non-Slack channel when its origin slot is MIRRORED there (`/link`).
 - **Configured outbound targets are transport-owned**: `MessagingTransport.configured_targets()` returns opaque `ConfiguredChannelTarget` records for the user-configured destinations a dashboard session may link to, including an explicit unavailable reason when a protocol needs prior inbound state or cannot send proactively. `resolve_configured_target()` revalidates the selected opaque id at the side-effect boundary and resolves it to `(conversation_id, thread_id)`; the browser never supplies an unchecked platform conversation id. Discord exposes configured users and threads, and fail-closes thread resolution unless Discord still reports the allow-listed id as an actual thread rather than a normal shared guild channel; Telegram exposes configured DMs; Webex exposes configured DMs plus, when `webex.allow_group_rooms` is on, each space in `webex.allowed_room_ids` as a `room:` target — and `resolve_configured_target` re-validates a `room:` id against BOTH the switch and the list, because an advertised target id travels through the browser and the LLM (it is the `target_id` an MCP send may name) and the config can narrow after one was minted; Weixin exposes allow-listed DMs plus authorized peers learned under its open policy; Teams destinations become available after an authorized inbound activity supplies a conversation/service URL; and WeCom advertises its allow-listed userids plus, under its allow-all policy, the peers it has learned — each either offered or listed with a reason, because `aibot_send_msg` needs no token but the platform only delivers into a conversation the user has already written to. Feishu destinations are visible but unavailable because replies are anchored to an inbound message (no proactive DM in v1).
 - **Configured-target egress is governed at every yield boundary**: the dashboard mirror-link endpoint enters the shared fail-closed `channels` governance ladder before resolving an opaque target (resolution may itself open a remote DM), rechecks before the initial link message, and rechecks before each historical-context message. A profile that narrows after transport startup therefore stops both target resolution and all subsequent sends.
-- **`/link` and `/unlink` are one pair with one location**: `rebind_conversation_location` claims what `release_conversation_location` frees, and both take the channel's single `_origin_mirror_link()` value — the release matches an occupied location by VALUE, so a second spelling of "this conversation" lets it miss the binding the bind wrote. Inside the rebind the **claim goes first**: `batched_save` writes on the way out even when the block raises, so an opt-out withdrawal ordered ahead of a refused claim would persist for a link that never happened and silently turn mirroring back on.
+- **`/link` and `/unlink` are one pair with one location**: `rebind_conversation_location` claims what `release_conversation_location` frees, and both take the channel's single `_origin_mirror_link()` value — the release matches an occupied location by VALUE, so a second spelling of "this conversation" lets it miss the binding the bind wrote. Inside the rebind the **claim goes first**: `batched_save` writes on the way out even when the block raises, so an opt-out withdrawal ordered ahead of a refused claim would persist for a link that never happened and silently turn mirroring back on. The value match is the whole `ChannelLink` and nothing else: a `dashboard:`-keyed session mirroring into the DM is swept whatever its key spelling, whether or not it accepts inbound, and whether or not the dashboard has **paused** it — `mirror_paused` is a delivery mute, not a second location, and the sweep drops it with the binding, so one `/unlink` frees the conversation and lifts the session-control refusal that the retained binding was causing (#14068; pinned in `test_discord.py::test_unlink_frees_a_paused_two_way_dashboard_mirror` and, against the real store, `test_session_map_mirror.py::TestReleaseConversationLocation::test_a_paused_dashboard_mirror_into_this_dm_is_swept`). When the paused binding accepted inbound, the unlink takes the resumed-session exit ("Left the resumed session") and frees the location on that path; the dashboard is nudged either way so the chip and the menu stop describing a binding that is gone.
 - **A proactive send names its destination and fails closed on it**: `send_message`'s Slack fields and its `channel_type` are mutually exclusive families, a refused channel delivery never falls through to Slack, and every refusal is audited and reported (502 `channel_delivery_failed`) rather than absorbed into a dashboard notification. The destination comes from gateway-owned state — a cron's job `session_key`, or the kernel-attested `X-Session-Key` header — never from the request body. See § Proactive sends.
 - **A capability the driver accepts, the shared pipeline must forward**: `drive_turn` hands `TurnDriver` every rung a forked dispatcher does, including `auto_approve_session`. Omitting one is not a missing feature but an ASYMMETRY, and it fails silently in the direction that LOOKS safe and is merely useless: the field existed on the driver while the pipeline never passed it, so an operator's `/yolo` grant — taken from the dashboard toggle or Telegram's `/yolo`, both of which write the same process-global grant — was inert on every channel riding `drive_turn`. Discord's fork does not pass it either, and has no `/yolo`; Telegram's does. The predicate is read PER REQUEST, never captured at turn start, so a mid-turn revoke takes effect on the next tool. The PreToolUse `tool_gate` still runs first, so a hard deny can never be overridden by it.
 - **A channel conversation binds itself as origin AND mirror, every turn**: a dispatcher supplies `ChannelTurn.origin_conversation` and `drive_turn` records it via `set_origin_link` (so unattended output — the auto-compact notice — has a target) and `bind_origin_mirror` (so a turn later taken from the dashboard comes back to the chat). Discord and Telegram run their own turn loops and write the same pair themselves, in the same order, on every non-resumed inbound turn (under `dm_scope="unified"` neither records an origin: a bucket that collapses every user's DMs has no single conversation to name). The pair is load-bearing beyond the notice: session control's owner-DM predicate admits a DM's mirror only when it EQUALS the recorded origin, which is how a mirror the dashboard retargeted at a thread is told apart from the DM mirroring itself — see [session-control](session-control.md). Re-asserted on every turn, because a restart, an unlink elsewhere, or a rival claim can REMOVE the binding and none of them repoints one; a binding already aimed elsewhere is therefore left alone. Guarded as a pair at the call site: losing the mirror costs a convenience, while raising there costs the user the answer they are waiting for, and this is the widest call site in the codebase. A channel that omits the field keeps its conversations unmirrored, which is why the roster in `autonudge._CHANNEL_KEY_PREFIXES` is narrower than `CHANNEL_SESSION_NAMESPACES` — a loop with no bound conversation fires into nothing while reporting itself healthy.
@@ -4016,13 +4047,49 @@ use yet rather than a limit: interactive `template_card` buttons and their
 `/101032` says the interactive card types require a configured callback URL, which
 is in tension with long-connection mode, and declaring a widget capability that
 cannot be verified against a live bot is the exact dishonesty
-`test_capability_ledger.py` exists to prevent); outbound media upload (the 3-step
-chunked `aibot_upload_media_*` sequence, which needs request/response correlation
-the client does not yet have, so `files_outbound` stays `False` and an image
-reference keeps printing its path — the honest degradation); per-group sessions;
+`test_capability_ledger.py` exists to prevent); per-group sessions;
 and the `enter_chat` / `feedback_event` events. `_handle_event` recognizes those
 event types and drops them deliberately: each owes a reply inside a 5-second
 single-delivery window, so answering one is a feature with its own design.
+
+**Outbound media send DOES ship** (the 3-step chunked `aibot_upload_media_init/chunk/finish`
+handshake in `wecom/media_upload.py` + `client.upload_media`, then a
+`send_file_proactive` `aibot_send_msg` frame): a `file_send` to a WeCom peer
+delivers the file as native WeCom media — a `.png`/`.jpg`/`.jpeg` as an image, an
+`.mp4`/`.webm` as video, everything else as a generic `file` — routed by
+`upload_destination.DOCUMENT_CHANNELS` + the `send_document` verb, and a non-empty
+caption follows as a companion text push. The extension→type map is deliberately
+narrow: a format maps to a richer type only when WeCom's own `type` accepts it AND
+`security.BINARY_MIME_ALLOWLIST` admits it at the upload gate. A gif/bmp/webp is
+allowlisted but WeCom's image type is JPG/PNG only, so it sends as an ordinary
+`file`; an image that exceeds the image type's tighter 2 MB cap but fits the
+20 MB `file` cap is likewise downgraded to `file` rather than failed. Voice is
+unmapped because `audio/amr` is not allowlisted at all — the upload gate refuses it
+with HTTP 400 `binary_mime_not_allowed` before `send_document` runs, so an `.amr`
+never sends (as voice or as file). `files_outbound` nonetheless stays
+`False`, because that flag gates a DIFFERENT thing: whether a renderer extracts a
+local image reference out of a sealed reply segment and uploads it inline. WeCom
+ships no such renderer-extraction path, so an inline image reference in a reply
+keeps printing its path — the honest degradation — and declaring the flag `True`
+would make the capability ledger claim an extraction WeCom does not do while
+changing nothing about the `send_document` path, which never reads it.
+
+The frame shapes (`aibot_upload_media_init/chunk/finish`, the `msgtype` media
+frames, the 512 KiB/100-chunk caps) are implemented from WeCom's published aibot
+API and exercised against a WS stand-in; a live-bot round trip for each media type
+is not reachable from CI and remains to be confirmed by a maintainer against the
+published protocol (or by a live send). Until then a wrong frame assumption would
+make a `file_send` fall back to the dashboard-link path rather than corrupt
+anything — the same degradation as before this change, not a new failure mode.
+
+**Size is capped PER TYPE, from WeCom's published limits** (message-push config,
+`developer.work.weixin.qq.com/document/path/91770`): an `image` and a `voice` note
+are each capped at 2 MB, a `file` and a `video` at 20 MB, and every object must
+exceed the platform's 5-byte floor. `media_upload.MAX_BYTES_BY_TYPE` is the one
+place those live; `prepare_upload` enforces `min(caller-ceiling, type-cap)`, so an
+oversize image or voice note is refused before the handshake starts rather than
+accepted locally and rejected by the platform mid-upload. This replaces the
+earlier single 20 MiB ceiling that every type shared.
 
 ## WeCom settings API
 

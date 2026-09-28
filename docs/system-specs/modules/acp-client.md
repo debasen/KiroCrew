@@ -255,47 +255,56 @@ this agents directory sees the same eviction-then-republish rather than the
 home-scoped skip a recorded alias gets. Every other gate still applies to it:
 this run's own set, live in-process projections and held leases are all checked
 first, and removal is identity-checked against the bytes and inode just read.
-The prune runs while the publication lock is held, which is what keeps a deletion
-from landing on an alias a publisher that takes the same lock is writing. That
-lock's acquisition ceiling is fixed. Reclaims, stale-candidate work, and total
-traversal have separate PER RUN ceilings, and classification carries a time
-budget on top of them. The reclaim cap is a ceiling and never a floor, and it
-bounds no part of the section on its own — a yielded candidate that turns out
-not to be reclaimable costs a classification and never increments it. Leases are read by ONE
-bounded scan per prune rather than one probe per candidate. Candidate discovery
+The prune runs while the publication lock is held, which is what keeps a
+deletion from landing on an alias a publisher that takes the same lock is
+writing. What one call bounds is the section it holds, not the pile it works on.
+Reclaims, stale-candidate work, and total traversal have separate PER RUN
+ceilings. Leases are read by ONE bounded scan per prune, taken before the walk.
+A lease is only created under this same lock, so none appears mid-walk; one
+released mid-walk (its finalizer takes no lock) still reads as held, which keeps
+its aliases one call longer and never frees one early. Candidate discovery
 streams the directory under an entry-walk limit: retained aliases do not consume
 the stale-work budget, but every directory entry consumes the separately bounded
-traversal budget, and skip credit is capped at one work-limit, so arbitrary
-padding and a large live set cannot extend the enumeration. Only the candidates
-that bounded walk yields are materialized. The time budget is a
-BETWEEN-candidate budget: it is read before each candidate, so it limits how many
-are walked and not how long any single one takes. Each call starts at a rotating
-offset into the bounded candidate list: a budgeted walk from a fixed start
-examines the same prefix every time, so entries that are kept at the front would
-hide the reclaimable remainder of the window behind them permanently. The offset
-is drawn per call rather than remembered, since the workload this bounds spawns a
-fresh process per run and a process-local cursor would restart at zero every
-time; reach within the window across successive spawns is therefore probabilistic
-rather than scheduled. The rotation covers the bounded window only: stable
-padding can keep aliases beyond the entry-walk limit deferred, so the ceiling
-guarantees bounded entry traversal rather than eventual drain. Reaching the entry-walk
-limit is logged at INFO, the same way the lease-scan ceiling is, so that
-deferral is visible without the doctor census.
-An accumulated backlog is cleared by a
-gateway-boot drain (`drain_stale_aliases`, reached from the boot janitor
-through the `agent_sdk.drivers.acp` seam): it runs that same per-spawn prune
-under the publication lock in a loop, pausing between batches for longer than
-the lock's poll cap so a waiting spawn can take the lock. A batch that cannot
-take the lock counts as one that reclaimed nothing. It stops after
-`_DRAIN_IDLE_BATCHES` consecutive batches that reclaim nothing, each from a
-fresh start offset, or at `_DRAIN_MAX_BATCHES`. A reclaim
+traversal budget, and skip credit is capped at one work-limit, so padding and a
+large live set cannot extend the enumeration. Reaching that limit is logged at
+INFO, the same way the lease-scan ceiling is. Classification then runs under
+`_PRUNE_MAX_SECONDS_PER_RUN`, a BETWEEN-candidate budget: it limits how many
+candidates are walked, not how long any single one takes. It is derived from the
+lock's acquisition ceiling -- the ceiling minus the lease scan's budget minus
+`_PROJECTION_PUBLICATION_RESERVE_SECS`, the share kept for the publication
+writes in the same section -- so retuning the ceiling moves the budget with it.
+Reclaims are capped at `_PRUNE_MAX_RECLAIMS_PER_RUN` plus the aliases the call
+publishes. That cap is a ceiling and never a floor: a candidate that proves
+unreclaimable costs a full classification without counting toward it, so a call
+can spend its whole budget and reclaim nothing. Each call starts its walk at an
+offset drawn at random into the bounded candidate list, because the workload
+spawns a fresh process per run and a remembered cursor would restart at zero
+every time; across spawns an entry inside that window is reached with some
+probability, never on a schedule, and entries beyond the entry-walk limit stay
+deferred while stable padding sits ahead of them, so the ceiling guarantees
+bounded entry traversal rather than eventual drain. So one call guarantees a
+bounded locked section and at most a capped number of reclaims. No call
+guarantees the pile is smaller afterwards. The pile shrinks only while aliases
+are reclaimed faster than callers mint new ones, and the mint rate is a property
+of the workload -- how often agents are spawned with views that differ -- not of
+this code: the budget sets how much work a call may do, not whether that work
+outpaces the callers. A gateway-boot drain (`drain_stale_aliases`, reached from
+the boot janitor through the `agent_sdk.drivers.acp` seam) runs that same
+per-spawn prune under the publication lock in a loop, pausing between batches
+for longer than the lock's poll cap so a waiting spawn can take the lock. A
+batch that cannot take the lock counts as one that reclaimed nothing. It stops
+after `_DRAIN_IDLE_BATCHES` consecutive batches that reclaim nothing, each from
+a fresh start offset, or at `_DRAIN_MAX_BATCHES`, and it removes what those
+batches reach; it does not promise an empty directory. A reclaim
 the filesystem itself refuses -- a read-only mount, an agents directory this
 process cannot write -- is reported as a warning naming the directory, the
 operation and the errno, at most once per interval with the count of refusals
 it stands for; only `EACCES`, `EPERM` and `EROFS` are diagnosed as an unwritable
 directory, and any other errno (`ENOENT` from a concurrent prune elsewhere,
 `EMFILE`) is reported by name with no such diagnosis. Every other `False`
-from the unlink is a deliberate keep and stays at debug. Projected agent JSON contains only fields accepted by Kiro's strict
+from the unlink is a deliberate keep and stays at debug.
+
+Projected agent JSON contains only fields accepted by Kiro's strict
 schema; lifecycle ownership lives in the non-spec
 `.kirocrew-skill-projection-metadata` directory. Each sidecar records the alias's
 exact byte digest, so a stale or replaced sidecar cannot authorize deletion of a
@@ -547,9 +556,17 @@ cancelled caller still lets the worker settle).
 
 Both the shared runtime and the legacy direct `AcpClient` route permission
 frames through `_dispatch.build_permission_event`, including the same provenance
-flags. A shell-cache hit whose value is `False` sets `shell_classified=True` —
-it is a resolved non-shell call, not a cache miss — and a structured-params
-cache hit sets `raw_params_trusted=True`.
+flags. The builder accepts string, integer, and float request ids, with booleans
+excluded. A float id (`5.0`) stays a float in the pending-request maps and is
+echoed unchanged by either an approval or rejection. A boolean, list, dict, or
+null id produces no event. A non-null invalid id is answered exactly once with
+JSON-RPC `-32600` (`"invalid request id"`) and touches no pending-request map; a
+null id remains a notification and is skipped without a reply or audit row.
+String-valued `toolCall` fields (`title`, `kind`, and `toolCallId`) normalize a non-string value
+to an empty string before redaction, cache lookup, or event construction. A
+shell-cache hit whose value is `False` sets `shell_classified=True` — it is a
+resolved non-shell call, not a cache miss — and a structured-params cache hit
+sets `raw_params_trusted=True`.
 
 The shell cache is written **only** from a usable backend `kind` string. A
 `tool_call` frame that omits `kind` writes nothing — even when its
@@ -636,6 +653,32 @@ genuine miss may carry inline data for display, but both provenance flags remain
 false and consumers that need trusted arguments fail closed.
 
 The host always sends one-shot approvals (`always=False`, the default). Kiro Crew — not the agent — owns the trust scope (`slot._trust`, `slot._trust_reads`, `slot._trusted_patterns`, `safety_override`, `channel.trusted`, parent session `approval_policy`). Per-call `session/request_permission` is required so Kiro Crew's PreToolUse hooks (`auto_deny_tools`, sensitive-path checks, credential redaction) fire on every tool invocation. The `always=True` path is reserved for a future "skip Kiro Crew hooks for this exact tool" feature; no caller passes it today.
+
+### Approval floor in `approve_tool` (`permission_floor.py`)
+
+Both transports' `approve_tool` methods (`AcpClient`, `AcpSessionHandle`) run the
+tool gate's security tiers before sending an `allow`: `_build_permission_event`
+records each event by request id in `_permission_gate_events`, and `approve_tool`
+pops it and calls `permission_floor.refusal_for(event)` off the loop. A SECURITY
+deny (the denied-command floor, the sensitive-path read and write checks, the
+unverifiable-shell refusal) or an id with no recorded event is answered with
+`reject_tool` and a `rejected_transport_floor` SEL row; a gate that cannot be
+built or consulted refuses (fail closed). Refusal reasons keep their original text
+for the in-band result, while operator logs and SEL metadata use the shared
+fail-closed redaction helper. Both methods return `True` only after they send an
+allow answer and `False` when this floor sends a rejection instead.
+Every production caller consumes that result before it records approved state or
+activity. This transport consultation is uncounted and writes no
+`governance_decision` row (`hooks.uncounted_gate`) because the consumer's
+identity-bearing consultation owns the gate decision and its audit.
+Governance (identity-scoped policy) stays with the caller identity: approval
+consumers call `HookManager.on_tool_call` or `refusal_for(event,
+session_key=..., agent=..., security_only=False)` before their approval tiers.
+This includes `stream_and_collect` under `AUTO_APPROVE`, the `AcpClient` internal
+auto-approve path, the evaluation runner, and the code-review pool. When an
+automatic helper resolves a request, it calls the shared identity-aware
+`refusal_for` body off the event loop. Provider adapters only forward an approval
+from a consumer that has completed that consultation.
 
 The rendered tool-input cache is consumed by the first permission event, but
 structured raw params remain keyed by `toolCallId` for the whole turn. A repeated
@@ -1157,7 +1200,9 @@ both `AcpClient` and `AcpSessionProvider` (called after `ensure_ready()`).
 
 ## Cancellation
 
-`cancel_session()` sends a `session/cancel` JSON-RPC notification to kiro-cli's stdin. It is fire-and-forget — no response ID is awaited.
+`cancel_session()` sends a `session/cancel` JSON-RPC notification to the agent's stdin. It is fire-and-forget — no response ID is awaited.
+
+After the notification it answers every permission request still open (`_permission_options`) with the `cancelled` outcome, as ACP requires. goose and pi do not acknowledge a cancel while a permission request is unanswered, so without this a Stop from a surface that had not rejected the open approval first waited out the ack budget and hard-killed the harness. Each answered request gets one SEL record (`tool_name=approval_cancel`, `outcome=rejected_on_cancel`) before the answers go out: one off-loop hop for all of them, bounded by `_SEL_AUDIT_TIMEOUT_SECONDS`. The answers are ordinary response frames through `_send_response`, so each carries the response-write no-progress bound. Both costs fall inside the cancel grace window. A cancelled pi gate dialog is recorded as denied, the same as a rejection.
 
 ### stopReason Parsing
 
@@ -1524,7 +1569,7 @@ kiro can return a `-32603` error that is an *advisory* that it substituted a dif
 
 `AcpError` (base), `AcpTimeoutError` (has `partial_output`), `AcpPermissionNeeded`, `AcpProcessDied` (and its transient subclass `AcpRegistrationRateLimited`, raised when the death's retained stderr shows a throttled dynamic registration), `AcpAuthRequired`, `AcpPromptBusy`.
 
-- `AcpProcessDied` is raised by every stdin writer on `BrokenPipeError` / `ConnectionResetError`, and additionally by the **response-frame** writers when `stdin.drain()` has not completed within `_RESPONSE_WRITE_BOUND_SECS` (5.0s, sized like chat_runner's `_STEER_NOTICE_BOUND_SECS`): `AcpClient._send_response` / `_send_error` raise it directly, and the shared `AcpRuntime.send_response` / `send_error` (the default kiro backend, one stdin for every multiplexed session) mark the runtime dead and raise `AcpRuntimeDead`, which `AcpSessionProvider` translates to `AcpProcessDied`. `drain()` returns at once while the pipe has room and parks only when the writer is flow-control paused — the pipe behind it is full — which is what a backend that stopped reading looks like, but also what a healthy backend looks like while it consumes another session's multi-MB prompt frame queued ahead of the response on the shared stdin. The bound is therefore a **no-progress** bound (`await_under_no_progress_bound` / `write_response_frame_bounded`): it polls the transport's write-buffer level and only gives up when the level held still for the whole window; a level that moved is activity — a shrink is the reader consuming, a growth is a frame from a writer the lock woke ahead of this caller landing on the pipe — and is measured again from the new level, so a large frame never gets a healthy shared runtime marked dead. A drop only counts when it is at least `_RESPONSE_WRITE_MIN_PROGRESS_BYTES` (4 KiB) per window, and that alone bounds the whole wait by construction: the level is finite and non-negative and every continued window removed at least the floor from it, so a backlog of B bytes is waited on for at most B/floor + 1 windows (plus the same for any sibling frame appended meanwhile). There is deliberately no flat ceiling — the largest frame is unbounded (any number of 5 MiB image blocks), so any fixed figure would either kill a live reader on a valid frame or be arbitrary. An awaitable found complete as a window closes counts as completed. A cancel notification (`cancel_session`, `send_notification`) waits for the lock under the same bound and is appended unlocked if the lock does not come, so the one cooperative signal that can end a wedged turn is never swallowed by the lock. The handle-owned deny sites in `session_handle.py` write their SEL audit before the (now bounded) reject write. Under the proactor loop (`_is_proactor_loop`, keyed to the public `asyncio.ProactorEventLoop`; Windows's subprocess pipes report the whole in-flight overlapped write until it completes, so the level is flat while a live reader consumes a large frame) the wait falls back to the single platform-limited window `_RESPONSE_WRITE_UNOBSERVABLE_BOUND_SECS`, a fixed 900s (~30 MiB at ~40 KiB/s, the one place a fixed figure remains because there is no level to derive from; test-pinned) — the same declared degradation as the Windows watchdog. That measurement is exact only with one writer in flight, so **every stdin write on a transport takes that transport's write lock** (`_stdin_write_lock`, on both `AcpClient` and `AcpRuntime`; request, notification, response and error frames alike), and the response write waits for the lock under the same no-progress bound — waiting for the lock is waiting for the previous frame's drain, and a lock held by a writer whose buffer no longer shrinks is the same stall. Nothing is appended behind a reader judged dead, and a runtime writer that queued for the lock re-checks `_dead` under it before writing, so a frame is never written into a runtime `_mark_dead` has already torn down. It cannot observe delivery of an accepted frame (the protocol gives no ack for a response); it bounds the wait on a paused writer whose reader consumes nothing, the same undeliverable-response condition a closed pipe reports, and routes it into the same session-reset + bounded-requeue recovery instead of pinning the deny path to the turn deadline. The premise that a healthy backend never leaves stdin unread for a whole window is the protocol's own: ACP is JSON-RPC over stdio, and every harness's stdin reader is the loop that delivers the permission response being written — a backend awaiting that response is, by construction, reading stdin; the window fires only when the level held perfectly still (nothing consumed), never on slow consumption. A transport that exposes no buffer size fails closed at the window. The request id in the warning log and the exception text passes through `_loggable_request_id` (`repr`, the shared `redact_text` scrub over the whole text, then the display cap — redact-before-bound; an id over the input cap is replaced by a length-only marker, never truncated, so a severed secret can never reach the redactor), because the id is backend-authored; every `id=`/`req=`/`method=` log line under `acp/` (client, runtime, session handle, dispatch) uses the same helper for every frame-fed slot on the statement (ids, session ids, tool-call ids, methods), and `test_deny_bounded_write.py` scans for any unlisted one. `_send_request` / `send_request` / `_send_and_await` (caller-sized payloads, bounded end to end by the turn deadline or the caller's own `wait_for`) keep a bare `drain()` under the lock; `cancel_session` / `send_notification` take the best-effort path described above (bounded lock wait, unlocked append fallback, bounded drain), and `_cancelled` is set before the write so the cancel-grace kill still ends the turn if even that fails.
+- `AcpProcessDied` is raised by every stdin writer on `BrokenPipeError` / `ConnectionResetError`, and additionally by the **response-frame** writers when `stdin.drain()` has not completed within `_RESPONSE_WRITE_BOUND_SECS` (5.0s, sized like chat_runner's `_STEER_NOTICE_BOUND_SECS`): `AcpClient._send_response` / `_send_error` raise it directly, and the shared `AcpRuntime.send_response` / `send_error` (the default kiro backend, one stdin for every multiplexed session) mark the runtime dead and raise `AcpRuntimeDead`, which `AcpSessionProvider` translates to `AcpProcessDied`. `drain()` returns at once while the pipe has room and parks only when the writer is flow-control paused — the pipe behind it is full — which is what a backend that stopped reading looks like, but also what a healthy backend looks like while it consumes another session's multi-MB prompt frame queued ahead of the response on the shared stdin. The bound is therefore a **no-progress** bound (`await_under_no_progress_bound` / `write_response_frame_bounded`): it polls the transport's write-buffer level and only gives up when the level held still for the whole window; a level that moved is activity — a shrink is the reader consuming, a growth is a frame from a writer the lock woke ahead of this caller landing on the pipe — and is measured again from the new level, so a large frame never gets a healthy shared runtime marked dead. A drop only counts when it is at least `_RESPONSE_WRITE_MIN_PROGRESS_BYTES` (4 KiB) per window, and that alone bounds the whole wait by construction: the level is finite and non-negative and every continued window removed at least the floor from it, so a backlog of B bytes is waited on for at most B/floor + 1 windows (plus the same for any sibling frame appended meanwhile). There is deliberately no flat ceiling — the largest frame is unbounded (any number of 5 MiB image blocks), so any fixed figure would either kill a live reader on a valid frame or be arbitrary. An awaitable found complete as a window closes counts as completed. A cancel notification (`cancel_session`, `send_notification`) waits for the lock under the same bound and is appended unlocked if the lock does not come, so the one cooperative signal that can end a wedged turn is never swallowed by the lock. The handle-owned deny sites in `session_handle.py` write their SEL audit before the (now bounded) reject write. Under the proactor loop (`_is_proactor_loop`, keyed to the public `asyncio.ProactorEventLoop`; Windows's subprocess pipes report the whole in-flight overlapped write until it completes, so the level is flat while a live reader consumes a large frame) the wait falls back to the single platform-limited window `_RESPONSE_WRITE_UNOBSERVABLE_BOUND_SECS`, a fixed 900s (~30 MiB at ~40 KiB/s, the one place a fixed figure remains because there is no level to derive from; test-pinned) — the same declared degradation as the Windows watchdog. That measurement is exact only with one writer in flight, so **every stdin write on a transport takes that transport's write lock** (`_stdin_write_lock`, on both `AcpClient` and `AcpRuntime`; request, notification, response and error frames alike), and the response write waits for the lock under the same no-progress bound — waiting for the lock is waiting for the previous frame's drain, and a lock held by a writer whose buffer no longer shrinks is the same stall. Nothing is appended behind a reader judged dead, and a runtime writer that queued for the lock re-checks `_dead` under it before writing, so a frame is never written into a runtime `_mark_dead` has already torn down. It cannot observe delivery of an accepted frame (the protocol gives no ack for a response); it bounds the wait on a paused writer whose reader consumes nothing, the same undeliverable-response condition a closed pipe reports, and routes it into the same session-reset + bounded-requeue recovery instead of pinning the deny path to the turn deadline. The premise that a healthy backend never leaves stdin unread for a whole window is the protocol's own: ACP is JSON-RPC over stdio, and every harness's stdin reader is the loop that delivers the permission response being written — a backend awaiting that response is, by construction, reading stdin; the window fires only when the level held perfectly still (nothing consumed), never on slow consumption. A transport that exposes no buffer size fails closed at the window. The request id in the warning log and the exception text passes through `_loggable_request_id` (`repr`, the shared `redact_text` scrub over the whole text, then the display cap — redact-before-bound; an id over the input cap is replaced by a length-only marker, never truncated, so a severed secret can never reach the redactor), because the id is backend-authored; every `id=`/`req=`/`method=` log line under `acp/` (client, runtime, session handle, dispatch) uses the same helper for every frame-fed slot on the statement (ids, session ids, tool-call ids, methods), and `test_deny_bounded_write.py` scans for any unlisted one. `_send_request` / `send_request` / `_send_and_await` (caller-sized payloads, bounded end to end by the turn deadline or the caller's own `wait_for`) keep a bare `drain()` under the lock; `cancel_session` / `send_notification` take the best-effort path described above (bounded lock wait, unlocked append fallback, bounded drain) for the notification itself; the `cancelled` answers `cancel_session` then writes for open permission requests are response frames and take the response-write bound, and `_cancelled` is set before the write so the cancel-grace kill still ends the turn if even that fails.
 - `AcpAuthRequired` — kiro-cli is not authenticated (`kiro-cli login` needed). Non-retryable: `ensure_ready()` skips the retry ladder and re-raises so callers surface the actionable message rather than reset-and-requeue.
 - `AcpPromptBusy` — a prompt is already in progress on the session, classified from kiro-cli's "already in progress" text via `_PROMPT_BUSY_RE` and raised at prompt-dispatch sites. `slack/handler.py` catches it and auto-resets the wedged session (`sessions.reset`) before recording the failure, so the next message cold-starts cleanly.
 
@@ -2186,3 +2231,16 @@ tree by awaiting `process.wait()` for the same reason the real
 `terminate_windows_asyncio_tree` does — that await is what populates `returncode`,
 so a double returning without it would report the placeholder on Windows and hide
 the amendment behind its own unfaithfulness.
+
+### Codex MCP result envelopes
+
+The parser extracts `rawOutput.result.content` text from successful Codex MCP
+results before session-directive decoding. Call identity and raw arguments stay
+on the native MCP call, including calls issued through `functions.exec`. A
+result wrapper is not an identity source. The session consumer binds fallback
+delivery to the identified tool's arguments and the requesting session/turn.
+
+The Codex spawn environment sets `DISABLE_MCP_CONFIG_FILTERING=true` so the
+adapter honors the session's MCP overrides even when a global configuration
+contains the same server name. This applies to both create and load; it changes
+configuration precedence, not authentication or the sandbox's credential mask.

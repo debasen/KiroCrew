@@ -160,6 +160,8 @@ _SPAWN_NAMES = {
     "create_subprocess_limited",
     "run_limited",
     "popen_limited",
+    # kiro_prerequisite's one-shot wrapper; its call sites must stay visible.
+    "spawn_supervised_oneshot",
 }
 
 # Tokens whose presence anywhere in the enclosing function marks the spawn as
@@ -195,6 +197,8 @@ _PREEXEC_TOKENS = (
     "create_subprocess_limited(",
     "run_limited(",
     "popen_limited(",
+    # Spawns through create_subprocess_limited, so its callers get the same limits.
+    "spawn_supervised_oneshot(",
     "resource_limit_preexec()",
     "session_host_preexec(",
 )
@@ -243,6 +247,13 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "acp/adapters/agy.py::_spawn_agy_process",
         "acp/adapters/agy.py::main",
         "acp/runtime.py::_get_rss_mb",
+        # The spawn primitive for three fixed-argv kiro-cli one-shots
+        # (`chat --list-models`, `whoami`, the `/usage` scrape). Every caller has
+        # already wrapped the argv with sandbox.wrap_argv and cgroup_scope_argv
+        # before handing it over; this function only prefixes the immutable
+        # process-group supervisor and spawns through create_subprocess_limited
+        # in a new session. Nothing agent-influenced reaches the argv here.
+        "kiro_prerequisite.py::spawn_supervised_oneshot",
         # Eight pre-existing spawns in one app's own test module, invisible to this
         # audit until receivers were derived from each file's imports: they are
         # reached through a function-local ``import subprocess as sp``. Every one is
@@ -2180,7 +2191,7 @@ def test_agent_influenced_sites_are_routed():
         "task_executor.py::run_tests",
         "git_coord.py::_git",
         "git_coord.py::_is_git_repo",
-        "dashboard/handlers/source_providers.py::_run_json",
+        "dashboard/source_providers/runner.py::_run_provider",
     ):
         assert key not in unrouted, (
             f"{key} must route its spawn through sandboxed_spawn_argv "

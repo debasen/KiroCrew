@@ -4,6 +4,7 @@ import { resizeImageForModel, type ResizeInfo } from '../utils/resizeImage'
 import type { ProjectionsBlock } from '../state/memberProjectionTypes'
 import type {
   AppContributor,
+  AgentTagPolicy,
   ChatSlot,
   CronJob,
   IssueSource,
@@ -3283,7 +3284,15 @@ export const api = {
    *  advances the folds it belongs to and leaves the rest where they were. */
   sessionCrewLogProjections: async (slot: string) => {
     const body = await fetch(`/api/sessions/${encodeURIComponent(slot)}/crew-log/projections`).then(j)
-    const read = body as { projections?: Record<string, unknown>; resolved?: unknown; writes_drained?: unknown }
+    const read = body as {
+      projections?: Record<string, unknown>
+      resolved?: unknown
+      writes_drained?: unknown
+      recording?: unknown
+      flag_value?: unknown
+      flag_recognised?: unknown
+      env_file?: unknown
+    }
     return {
       folds: read.projections ?? {},
       // Whether a unit was NAMED for the id sent. An empty fold cannot say why it
@@ -3295,6 +3304,16 @@ export const api = {
       // taken, so the value may be behind the record. Absent reads as drained: an
       // older gateway does not send the field and did not race either.
       writesDrained: read.writes_drained !== false,
+      // False only when the gateway says recording is switched off. Absent reads as
+      // on: an older gateway does not send the field.
+      recording: read.recording !== false,
+      // The KIROCREW_CREW_LOG value that switched it off, so the panel can quote it.
+      // Empty when the gateway does not send one.
+      flagValue: typeof read.flag_value === 'string' ? read.flag_value : '',
+      // False when that value is not one of the switch-off spellings.
+      flagRecognised: read.flag_recognised !== false,
+      // The `.env` the gateway reads; the default home's when the gateway sends none.
+      envFile: typeof read.env_file === 'string' && read.env_file ? read.env_file : '~/.kiro/crew/.env',
     }
   },
   telemetryStartup: () => fetch('/api/telemetry/startup').then(j),
@@ -3638,7 +3657,7 @@ export const api = {
   cloudIdentity: () => get('/api/cloud/identity').then(j) as Promise<CloudIdentity>,
   // `provider_id` is optional on the wire: the server defaults it to "aws_ec2"
   // and answers 400 `unknown_provisioner` for an id it does not offer.
-  cloudLaunch: (body: { provider_id?: string; profile: string; region: string; size_key: string; login_target?: KiroLoginTarget }) =>
+  cloudLaunch: (body: { provider_id?: string; profile: string; region: string; size_key: string; subnet_id?: string; login_target?: KiroLoginTarget }) =>
     post('/api/cloud/launch', body).then(j) as Promise<LaunchJob>,
   cloudLaunchStatus: (id: string) =>
     get('/api/cloud/launch/' + encodeURIComponent(id)).then(j) as Promise<LaunchJob>,
@@ -3795,6 +3814,12 @@ export const api = {
       key: string; title: string; slot_key: string; untitled: boolean
       agent: string; pid: number | null; owns_runtime: boolean; prompts: number
       channel: string
+      /**
+       * Live sessions sharing this row's runtime; 1 when exclusive. Optional
+       * because an older gateway does not send it — absent reads as exclusive,
+       * which is the pre-sharing shape rather than a guess in either direction.
+       */
+      sharers?: number
       rss_mb: number | null; procs: number | null; mcp: number | null
       cpu_cores: number | null; uptime_s: number | null
       credits: number | null; turns: number | null
@@ -4428,25 +4453,30 @@ export const api = {
   connectionsOAuthClientDelete: (slug: string) =>
     del(`/api/connections/oauth-clients/${encodeURIComponent(slug)}`).then(j) as Promise<{ ok: boolean; client: ConnectionOAuthClient | null }>,
   // MCP Gateway (shared pool)
-  mcpGatewayStatus: () => fetch('/api/mcp-gateway/status').then(j) as Promise<{ enabled: boolean; stub: string[]; stub_count: number; running: boolean; ping_ok: boolean; supported: boolean }>,
+  mcpGatewayStatus: () => fetch('/api/mcp-gateway/status').then(j) as Promise<{ enabled: boolean; stub: string[]; stub_count: number; running: boolean; ping_ok: boolean; supported: boolean; launch_refused?: Record<string, { reason: 'added_outside_dashboard' | 'changed_needs_reapproval'; commands?: string[][]; envs?: string[][]; approved_commands?: string[][]; approved_envs?: string[][]; complete?: boolean; expected_launch?: string }> }>,
   mcpGatewayEnable: (enabled: boolean) => post('/api/mcp-gateway/enable', { enabled }).then(j) as Promise<{ ok: boolean; enabled: boolean; running: boolean; ping_ok: boolean }>,
-  mcpGatewayMetrics: () => fetch('/api/mcp-gateway/metrics').then(j) as Promise<{ running: boolean; size?: number; max_backends?: number; backends: { server: string; agent: string; pid: number | null; sessions: number; idle_s: number; rss_kb: number }[]; warm_pool_hits?: number; warm_pool_misses?: number; warm_pool_hit_rate_pct?: number }>,
+  mcpGatewayMetrics: () => fetch('/api/mcp-gateway/metrics').then(j) as Promise<{ running: boolean; size?: number; max_backends?: number; backends: { server: string; agent: string; pid: number | null; stubs?: number; idle_s: number; rss_kb: number }[]; warm_pool_hits?: number; warm_pool_misses?: number; warm_pool_hit_rate_pct?: number }>,
   mcpGatewayServers: () => fetch('/api/mcp-gateway/servers').then(j) as Promise<{ servers: McpManagedServer[] }>,
-  mcpGatewaySetStub: (name: string, stub: boolean) => post('/api/mcp-gateway/servers/stub', { name, stub }).then(j) as Promise<{ ok: boolean; name: string; stub: boolean; enabled?: boolean; applied?: boolean; restart_required?: boolean; stub_servers?: string[] }>,
+  // What the gateway would run for this server, so the operator approves a
+  // command rather than a name. `expected_launch` is the identity the approval
+  // is written against and is present only when every command could be shown.
+  mcpGatewayLaunchPreview: (name: string) => fetch(`/api/mcp-gateway/servers/launch?name=${encodeURIComponent(name)}`).then(j) as Promise<{ name: string; commands: string[][]; envs: string[][]; complete: boolean; expected_launch?: string }>,
+  mcpGatewaySetStub: (name: string, stub: boolean, expectedLaunch?: string, resolveEligibility = false) => post('/api/mcp-gateway/servers/stub', { name, stub, ...(expectedLaunch ? { expected_launch: expectedLaunch } : {}), ...(resolveEligibility ? { resolve_eligibility: true } : {}) }).then(j) as Promise<{ ok: boolean; name: string; stub: boolean; stubbed?: string[]; skipped?: Array<{ name: string; reason: string }>; sharing_on?: boolean; enabled?: boolean; applied?: boolean; restart_required?: boolean; stub_servers?: string[] }>,
   mcpResolveRefresh: () => post('/api/mcp-gateway/resolve-refresh', {}).then(j) as Promise<{ ok: boolean; reason?: string; resolved: Record<string, 'ready' | 'unresolved' | 'error'>; ready?: string[] }>,
   // Starting a measurement pass returns immediately: it spawns two processes per
   // unmeasured server, so the answer arrives through the progress read, not here.
   mcpMeasureStart: () => post('/api/mcp/measure', {}).then(j) as Promise<McpMeasureProgress>,
   mcpMeasureProgress: () => fetch('/api/mcp/measure').then(j) as Promise<McpMeasureProgress>,
-  // Batch form of the above -- one config write for the whole set, so "toggle
-  // all" can't land the allowlist half-flipped. Like the single form it records
-  // rather than applies, and answers `restart_required`.
+  // Batch form of the above, for turning stubs OFF -- one config write for the
+  // whole set, so "unstub all" can't land the allowlist half-flipped. Like the
+  // single form it records rather than applies, and answers `restart_required`.
   //
-  // `resolveEligibility` hands the decision to the server: it re-reads the sharing
-  // switch and each server's verdict inside the same lock hold that writes them, so
-  // the policy and the write cannot disagree. The response then reports `stubbed`
-  // and `skipped` rather than echoing the request, because the two differ by design.
-  mcpGatewaySetStubMany: (names: string[], stub: boolean, resolveEligibility?: boolean) => post('/api/mcp-gateway/servers/stub', resolveEligibility ? { names, stub, resolve_eligibility: true } : { names, stub }).then(j) as Promise<{ ok: boolean; names: string[]; stub: boolean; stubbed?: string[]; skipped?: Array<{ name: string; reason: string }>; sharing_on?: boolean; applied?: boolean; restart_required?: boolean; stub_servers?: string[] }>,
+  // `stub: false` only, and the endpoint refuses a batch stub=true: turning a stub
+  // ON approves the exact command that server would run, and one body cannot carry
+  // one launch identity per name. Enabling is therefore a request per server.
+  // The response reports `stubbed` and `skipped` rather than echoing the request,
+  // because the server decides which names it acts on.
+  mcpGatewaySetStubMany: (names: string[], stub: false) => post('/api/mcp-gateway/servers/stub', { names, stub }).then(j) as Promise<{ ok: boolean; names: string[]; stub: false; stubbed?: string[]; skipped?: Array<{ name: string; reason: string }>; sharing_on?: boolean; applied?: boolean; restart_required?: boolean; stub_servers?: string[] }>,
   // Agent config
   agentConfig: () => fetch('/api/agent/config').then(j),
   saveAgentConfig: (config: object) => put('/api/agent/config', { config }).then(j),
@@ -4567,7 +4597,14 @@ export const api = {
   /** Structured monitor records include terminal outcomes for inspection. */
   monitorsList: (): Promise<{ enabled: boolean; monitors: unknown[] }> =>
     fetch('/api/monitors').then(j),
-  monitorForSlot: (slot: string): Promise<{ enabled: boolean; monitor: unknown | null }> =>
+  /** `max_runtime_ceiling_secs` is the LIVE operator ceiling
+   *  (`monitoring.max_runtime_secs`), which a default install sets far below the
+   *  contract's absolute maximum; the popover bounds its runtime input by it. */
+  monitorForSlot: (slot: string): Promise<{
+    enabled: boolean
+    monitor: unknown | null
+    max_runtime_ceiling_secs?: number
+  }> =>
     fetch('/api/monitors/slot/' + encodeURIComponent(slot)).then(j),
   monitorCreate: (body: Required<MonitorWrite>): Promise<MonitorResponse> =>
     post('/api/monitors', body).then(j) as Promise<MonitorResponse>,
@@ -4688,7 +4725,12 @@ export const api = {
     { channel_type: channelType, target_id: targetId },
   ).then(j),
   remindMirror: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/mirror-link').then(j),
-  unlinkMirror: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/mirror-unlink').then(j),
+  // Severs the binding a link row names — the session's mirror OR its Slack
+  // thread: `expected` is the row's `{channel_type, binding}` and the server
+  // routes a `slack` binding to the Slack teardown itself, so the menu carries
+  // no channel-to-endpoint assumption. Without `expected`, an unconditional
+  // clear of the mirror for callers that hold no row.
+  unlinkMirror: (slot: string, expected?: { channel_type: string; binding: string }) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/mirror-unlink', expected).then(j),
   slackChannels: () => fetch('/api/slack/channels').then(j),
   // Folders
   chatFolders: () => fetch('/api/chat/folders', { headers: { ..._sk } }).then(j),
@@ -4734,7 +4776,8 @@ export const api = {
   // Tags
   chatTags: () => fetch('/api/chat/tags', { headers: { ..._sk } }).then(j),
   createChatTag: (name: string, color?: string, status?: boolean) => post('/api/chat/tags', { name, color: color || '', status: !!status }).then(j),
-  updateChatTag: (id: string, body: { name?: string; color?: string; order?: number; status?: boolean }) => patch('/api/chat/tags/' + encodeURIComponent(id), body).then(j),
+  adoptChatTag: (id: string, status: boolean) => post('/api/chat/tags/' + encodeURIComponent(id) + '/adopt', { status }).then(j),
+  updateChatTag: (id: string, body: { name?: string; color?: string; order?: number; status?: boolean; agent?: AgentTagPolicy }) => patch('/api/chat/tags/' + encodeURIComponent(id), body).then(j),
   deleteChatTag: (id: string) => del('/api/chat/tags/' + encodeURIComponent(id)).then(j),
   setSlotTags: (slot: string, tags: string[], baseTagsRevision?: string) => fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/tags', { method: 'PUT', headers: { 'Content-Type': 'application/json', ..._sk }, body: JSON.stringify(baseTagsRevision ? { tags, base_tags_revision: baseTagsRevision } : { tags }) }).then(j),
   dropSlotToColumn: (slot: string, columnId: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/drop', { column_id: columnId }).then(j),

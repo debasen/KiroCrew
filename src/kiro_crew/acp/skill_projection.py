@@ -94,13 +94,6 @@ _PROJECTION_PRUNE_WORK_LIMIT = 4096
 # that is unreclaimable costs a full classification and never increments it,
 # which is why the section carries its own budget below.
 _PRUNE_MAX_RECLAIMS_PER_RUN = 64
-# The budget for one call's classification work, and a BETWEEN-candidate one: it
-# bounds how many candidates are walked, not how long any single one takes, and
-# the directory enumeration that precedes the walk is outside it. Sized well under
-# _PROJECTION_LOCK_TIMEOUT_SECS and sharing that ceiling with the publication
-# writes in the same section -- two atomic writes per alias plus the settings
-# commit -- so it has to leave room for those, not merely fit under the ceiling.
-_PRUNE_MAX_SECONDS_PER_RUN = 0.4
 # The boot drain runs the per-spawn prune in a loop, so each batch holds the
 # publication lock at most as long as one spawn's prune does. The pause between
 # batches lets a waiting spawn take the lock: a blocked acquire polls with
@@ -137,6 +130,22 @@ _PROJECTION_METADATA_DIR_NAME = ".kirocrew-skill-projection-metadata"
 # jitter and short Windows rename retries without inheriting the generic five-minute
 # lock ceiling on the native startup path.
 _PROJECTION_LOCK_TIMEOUT_SECS = 2.0
+# The share of that ceiling the prune walk must leave to the rest of its locked
+# section: the publication writes (two atomic writes per alias plus the settings
+# commit) and scheduler jitter. The lease scan's budget is taken out on its own.
+_PROJECTION_PUBLICATION_RESERVE_SECS = 1.2
+
+
+def _prune_budget_within(ceiling: float) -> float:
+    """The walk's share of ``ceiling`` once the lease scan and publication reserve are out."""
+    return ceiling - _PROJECTION_PUBLICATION_RESERVE_SECS - _PROJECTION_LEASE_SCAN_MAX_SECONDS
+
+
+# The budget for one call's classification work, and a BETWEEN-candidate one: it
+# bounds how many candidates are walked, not how long any single one takes, and
+# the directory enumeration that precedes the walk is outside it. Derived from the
+# lock ceiling, so retuning the ceiling moves the budget and keeps the reserve.
+_PRUNE_MAX_SECONDS_PER_RUN = _prune_budget_within(_PROJECTION_LOCK_TIMEOUT_SECS)
 
 # Generated specs stay in Kiro's shared agents directory, so metadata identifies
 # them for direct scanners and scopes cleanup to the owning Kiro Crew data home.
@@ -734,6 +743,55 @@ def _settings(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError(f"Kiro settings must be an object: {path}")
     return data
+
+
+def _inheritance_preference(
+    local: dict[str, Any], global_settings: dict[str, Any]
+) -> tuple[bool, Any, bool]:
+    """Return ``(inherited, source, overlaid)`` for custom agents in one workspace.
+
+    Once Crew's overlay is in place the native key reads ``true`` whatever the
+    user chose, so the recorded preference decides: a ``global`` source follows
+    the live global setting and any other source keeps the recorded value.
+    Without the overlay, or after the user moves the native key off ``true``,
+    the native key decides -- the workspace value when present, else the global
+    one -- and only the literal ``true`` opts out.
+    """
+    inherited = local.get(_MANAGED_SETTING)
+    source = local.get(_INHERIT_SOURCE)
+    if not isinstance(inherited, bool) or local.get(_INHERIT_SETTING) is not True:
+        source = "local" if _INHERIT_SETTING in local else "global"
+        native = local.get(_INHERIT_SETTING, global_settings.get(_INHERIT_SETTING))
+        return native is not True, source, False
+    if source == "global":
+        return global_settings.get(_INHERIT_SETTING) is not True, source, True
+    return inherited, source, True
+
+
+def inherits_default_resources(work_dir: str | os.PathLike[str] | None) -> bool:
+    """Whether a custom agent started in *work_dir* inherits kiro-cli's default resources.
+
+    Those defaults are global and workspace steering plus ``AGENTS.md``. This is
+    the read-only twin of the decision :func:`prepare_native_skill_projection`
+    makes, for callers that must mirror what the native agent loads. Settings
+    that cannot be read keep inheritance, which is how those callers behaved
+    before they asked.
+    """
+    try:
+        global_settings = _settings(kiro_home() / "settings" / "cli.json")
+        local = (
+            _settings(Path(work_dir) / ".kiro" / "settings" / "cli.json")
+            if work_dir is not None
+            else {}
+        )
+    # RuntimeError: Path.resolve() reports a symlink loop that way before Python 3.13.
+    except (OSError, ValueError, RuntimeError, RecursionError, FileTooLargeError):
+        logger.warning(
+            "skill projection: Kiro settings unreadable; keeping inherited resources",
+            exc_info=True,
+        )
+        return True
+    return _inheritance_preference(local, global_settings)[0]
 
 
 def _restore_inheritance(path: Path, local: dict[str, Any]) -> None:
@@ -1595,20 +1653,14 @@ def prepare_native_skill_projection(
                 # the same sidecar lock, so no effort or Tool Search update can land
                 # between this read and commit.
                 local = _settings(locked_settings)
-                inherited = local.get(_MANAGED_SETTING)
-                preference_source = local.get(_INHERIT_SOURCE)
-                if not isinstance(inherited, bool) or local.get(_INHERIT_SETTING) is not True:
+                inherited, preference_source, overlaid = _inheritance_preference(
+                    local, global_settings
+                )
+                if not overlaid:
                     local[_PREVIOUS_INHERITANCE] = {
                         "present": _INHERIT_SETTING in local,
                         "value": local.get(_INHERIT_SETTING),
                     }
-                    preference_source = "local" if _INHERIT_SETTING in local else "global"
-                    inherited = (
-                        local.get(_INHERIT_SETTING, global_settings.get(_INHERIT_SETTING))
-                        is not True
-                    )
-                elif preference_source == "global":
-                    inherited = global_settings.get(_INHERIT_SETTING) is not True
 
                 if inherited:
                     for view in specs.values():

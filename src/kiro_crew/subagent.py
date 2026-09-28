@@ -43,6 +43,7 @@ from kiro_crew.agent_sdk.drivers.acp_vocab import (  # noqa: F401 - STOP_* resol
 )
 from kiro_crew.execution_context import read_session_execution
 from kiro_crew.executors import run_in_embed_pool
+from kiro_crew.permission_floor import OUTCOME_REJECTED_TRANSPORT_FLOOR
 
 if TYPE_CHECKING:
     from kiro_crew.execution_context import ExecutionContext
@@ -109,6 +110,22 @@ from kiro_crew.llm_helpers import (
 from kiro_crew.mcp_gateway import STUB_MODULE
 from kiro_crew.metrics.events import CHILD_PERMISSION_DENIED, emit_counter
 from kiro_crew.platform.context import redact_via_context
+from kiro_crew.process_identity import (  # noqa: F401 - resolved by run.py/terminal.py via bind_component_globals
+    MAX_ERROR_DETAIL_LEN,
+    ProcessHandle,
+    add_handle,
+    ending_fence,
+    failure_name,
+    join_failures,
+    kill_each,
+    kill_set,
+    kill_verified_process,
+    process_handle_of,
+    process_survived_async,
+    spawn_in_flight,
+    teardown_capture,
+    with_kill_failure,
+)
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
@@ -125,7 +142,10 @@ from kiro_crew.security import (
     redact_exfiltration_urls,
 )
 from kiro_crew.sel import sel
-from kiro_crew.session import SessionManager
+from kiro_crew.session import (  # noqa: F401 - child_process_helpers resolved by terminal.py via bind_component_globals
+    SessionManager,
+    child_process_helpers,
+)
 from kiro_crew.session_surface import has_dashboard_surface
 from kiro_crew.session_workspace import result_path as _ws_result_path
 from kiro_crew.slack.format import extract_options
@@ -163,7 +183,7 @@ from kiro_crew.subagent_manager.monitoring import (  # noqa: F401 - resolved by 
     orphan_resume_hint,
     tombstone_recovery_action,
 )
-from kiro_crew.subagent_persistence import (
+from kiro_crew.subagent_persistence import (  # noqa: F401 - read_tombstone resolved by run.py via bind_component_globals
     _agent_dir,
     _cleanup_session_files_sync,
     _subagents_dir,
@@ -174,6 +194,7 @@ from kiro_crew.subagent_persistence import (
     mark_delivered,
     prune_stale_tombstones,
     read_state,
+    read_tombstone,
     record_slow_command,
     update_state,
     write_result_chunk,
@@ -846,9 +867,10 @@ def _redact_and_truncate(text: str, max_chars: int) -> str:
     return redact_and_truncate(text, max_chars)
 
 
-# Bounds for a rendered exception chain. The rendering reaches a WS frame, a
-# tombstone and the Subagents panel, so it is capped rather than trusted.
-_MAX_ERROR_DETAIL_LEN = 2_000
+# Bound for a rendered exception chain. The rendering reaches a WS frame, a
+# tombstone and the Subagents panel, so it is capped rather than trusted -- to
+# ``process_identity.MAX_ERROR_DETAIL_LEN``, the one bound every retained error
+# field of a run's terminal record is held to.
 _MAX_ERROR_CHAIN = 4
 
 
@@ -885,7 +907,7 @@ def _describe_exception(exc: BaseException) -> str:
         if nxt is None and not current.__suppress_context__:
             nxt = current.__context__
         current = nxt
-    return " <- caused by ".join(parts)[:_MAX_ERROR_DETAIL_LEN]
+    return " <- caused by ".join(parts)[:MAX_ERROR_DETAIL_LEN]
 
 
 _MAX_DONE_RESULT_LEN = 50_000  # cap subagent_done payload to avoid bloating WS frames
@@ -939,6 +961,13 @@ _STEER_STARTUP_POLL_SECS = 0.5
 # latency is irrelevant next to permanent wedging.
 _WAVE_STUCK_SECS = 1800
 _RESET_TIMEOUT = 30.0  # max seconds for session reset in finally block
+# How long past ``_RESET_TIMEOUT`` the run's terminal report waits for its
+# teardown to decide the kill before publishing. The reset half of the
+# teardown is bounded by ``_RESET_TIMEOUT``; the kill half (the fallback's
+# executor hops, sequential over every handle) is not, so this is a grace,
+# not a bound on the teardown -- and a report whose wait runs out publishes
+# the record with the kill named UNDECIDED, never clean (``_report_terminal``).
+_TEARDOWN_REPORT_GRACE = 30.0
 _RECOVERY_SLOT_WAIT_SECS = 60.0
 _REPORT_DRAIN_TIMEOUT = (
     30.0  # max seconds cancel_all() waits for shielded terminal reports to drain
@@ -3112,6 +3141,17 @@ class SubagentManager:
         # makes that inference unnecessary. Removed by the same ``finally`` that sets
         # the event, so a missing entry always means "nothing left to wait for".
         self._teardown_gates: dict[str, asyncio.Event] = {}
+        #: run id -> the kill handles of every process its session key named,
+        #: RETAINED across the reset that pops the session from the map (see
+        #: :class:`kiro_crew.process_identity.ProcessHandle`).
+        #: Written by :meth:`_retain_process_handles` from whichever teardown path
+        #: reaches the reset first -- the run's own ``finally`` or the reaper --
+        #: and read by the other on a session-map miss, so a force-stop that
+        #: arrives while the first reset is hanging can still name, verify and
+        #: signal the process. Cleared when the path that holds it has decided
+        #: (the handles were consumed by the kill, or the survivor check found
+        #: the processes gone); an entry that outlives its run is one small record.
+        self._process_handles: dict[str, list[ProcessHandle]] = {}
         #: parent session key -> event pulsed whenever one of its runs reaches a
         #: terminal report. Created on demand by :meth:`completion_event` and
         #: dropped by :meth:`release_completion_event`, so the only entries are
@@ -3144,6 +3184,20 @@ class SubagentManager:
         # finalize_batch alongside _batch_submitted.
         self._batch_progress_ts: dict[str, float] = {}
         self._reaper_task: asyncio.Task | None = None  # type: ignore[type-arg]
+        # Every ``_force_reap`` that runs OUTSIDE the reaper task -- a dashboard
+        # Stop, a parent-end or stage-boundary cancel, each awaited inside its
+        # caller's own task. ``cancel_all`` cancels these beside the reaper task
+        # so their cancellation arms finish the record and release the report
+        # inside the shutdown drain: a reap the shutdown never touched sat in
+        # its hanging reset until the gateway's budget hard-exited the process,
+        # with its report waiting on a gate nobody released.
+        self._reap_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
+        # The one reap in flight per run, by agent id: a future its owner settles
+        # on every exit. A second stop path arriving while it is pending (a
+        # dashboard Stop racing a deadline reap, or the reverse) joins it
+        # instead of running a second reap, so the kill is decided, recorded
+        # and reported once. See ``_force_reap``.
+        self._reaps_in_flight: dict[str, asyncio.Future] = {}  # type: ignore[type-arg]
         # Cache global approval_mode at init to avoid disk I/O on every
         # parentless spawn (cron, webhooks).
         try:
@@ -3493,21 +3547,25 @@ class SubagentManager:
         metadata: dict | None = None,
         info: "SubagentInfo | None" = None,
     ) -> None:
-        await client.approve_tool(request_id)
+        approval_sent = await client.approve_tool(request_id)
         # An APPROVED child-origin escalation is side-effect activity: count
         # it in tool_count so the transient-retry / cancel-respawn replay
         # gates see it (an approved child mutation must never be replayed by
         # a bare original prompt). Counted here — on the approval outcome —
         # not at receipt: a purely rejected escalation executed nothing and
         # must not permanently disable the run's replay budget.
-        if info is not None and event.sub_session_id:
+        if approval_sent is not False and info is not None and event.sub_session_id:
             info.tool_count += 1
         sel().log_tool_invocation(
             session_key=session_key,
             source="subagent",
             tool_name=event.title,
             tool_kind=event.tool_kind,
-            outcome="auto_approved" if metadata and metadata.get("reason") else "approved",
+            outcome=(
+                "auto_approved"
+                if approval_sent is not False and metadata and metadata.get("reason")
+                else "approved" if approval_sent is not False else OUTCOME_REJECTED_TRANSPORT_FLOOR
+            ),
             request_id=request_id,
             metadata=metadata,
         )
@@ -3587,12 +3645,30 @@ class SubagentManager:
             return False
 
     @staticmethod
-    def _kill_orphan_pid(pid: int) -> None:
-        """Best-effort SIGKILL of an orphaned process."""
+    async def _kill_orphan_pid(pid: int) -> str | None:
+        """Best-effort SIGKILL of an orphaned process; returns what stopped it.
+
+        ``None`` once the process is gone -- signalled here, or already exited
+        by the time the signal went out (nothing to kill is not a failure) --
+        and otherwise the failure the kill raised (``PermissionError: …``),
+        named the way the reaper's record names one, so the caller's audit row
+        can say ``failed`` for a process the kill left standing rather than
+        ``killed`` regardless. Never raises: the caller owns a reconciliation
+        it must still finish.
+
+        The signal goes through :func:`platform_compat.kill_pid_async`: the
+        Windows kill is a ``taskkill`` spawn that waits up to five seconds for
+        the target, and the reconciliation runs on the event loop, so that wait
+        happens on the subprocess executor while the loop keeps serving; the
+        POSIX ``os.kill`` is a non-blocking syscall and runs inline.
+        """
         try:
-            platform_compat.kill_pid(pid, platform_compat.SIGKILL)
-        except (ProcessLookupError, OSError):
-            pass
+            await platform_compat.kill_pid_async(pid, platform_compat.SIGKILL)
+        except ProcessLookupError:
+            return None
+        except OSError as exc:
+            return failure_name(exc)
+        return None
 
     async def _notify_orphan(
         self, agent_id: str, state: dict, recovery: str, has_result: bool
@@ -3741,6 +3817,7 @@ class SubagentManager:
         mark_delivered_on_success: bool,
         settle_digest: bool = False,
         teardown_done: "asyncio.Event | None" = None,
+        gate: "asyncio.Future[bool] | None" = None,
     ) -> bool:
         return await self._terminal._report_terminal_impl(
             info,
@@ -3749,6 +3826,7 @@ class SubagentManager:
             mark_delivered_on_success=mark_delivered_on_success,
             settle_digest=settle_digest,
             teardown_done=teardown_done,
+            gate=gate,
         )
 
     async def _run_terminal_report(
@@ -3779,6 +3857,7 @@ class SubagentManager:
         mark_delivered_on_success: bool,
         settle_digest: bool = False,
         teardown_done: "asyncio.Event | None" = None,
+        gate: "asyncio.Future[bool] | None" = None,
     ) -> "asyncio.Task[bool]":
         return self._terminal._spawn_terminal_report_impl(
             info,
@@ -3787,6 +3866,7 @@ class SubagentManager:
             mark_delivered_on_success=mark_delivered_on_success,
             settle_digest=settle_digest,
             teardown_done=teardown_done,
+            gate=gate,
         )
 
     @staticmethod
@@ -4221,8 +4301,27 @@ class SubagentManager:
     ) -> None:
         return await self._terminal._force_reap_impl(agent_id, info, elapsed, reason=reason)
 
-    async def _sigkill_session(self, session_key: str) -> None:
-        return await self._terminal._sigkill_session_impl(session_key)
+    async def _reap_once(
+        self, agent_id: str, info: SubagentInfo, elapsed: float, *, reason: str = ""
+    ) -> None:
+        return await self._terminal._reap_once_impl(agent_id, info, elapsed, reason=reason)
+
+    async def _sigkill_session(self, session_key: str, handle: ProcessHandle | None) -> str | None:
+        return await self._terminal._sigkill_session_impl(session_key, handle)
+
+    async def _sigkill_sessions(self, session_key: str, handles: list[ProcessHandle]) -> str | None:
+        return await self._terminal._sigkill_sessions_impl(session_key, handles)
+
+    def _sessions_under(self, session_key: str) -> list[tuple[Any, ProcessHandle]]:
+        return self._terminal._sessions_under_impl(session_key)
+
+    def _retain_process_handles(
+        self,
+        agent_id: str,
+        session_key: str,
+        pairs: list[tuple[Any, ProcessHandle]] | None = None,
+    ) -> list[ProcessHandle]:
+        return self._terminal._retain_process_handles_impl(agent_id, session_key, pairs)
 
     def notify_injection_failed(
         self, info: SubagentInfo, reason: str = "delivery timed out"
@@ -5201,7 +5300,7 @@ class SubagentManager:
                 # not enough to act on. ``info.error`` is in-memory only and
                 # dies with the gateway, so without this the specific reason is
                 # recoverable from nothing but the log.
-                detail=(_redact(info.error)[:_MAX_ERROR_DETAIL_LEN] if info.error else ""),
+                detail=(_redact(info.error)[:MAX_ERROR_DETAIL_LEN] if info.error else ""),
             )
         except Exception:
             logger.debug("Failed to write tombstone for %s", info.id, exc_info=True)

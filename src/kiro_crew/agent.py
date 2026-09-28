@@ -1839,9 +1839,9 @@ def _all_skill_paths() -> list[str]:
                     current_event = ""
                     if manifest.is_file():
                         try:
-                            current_event = json.loads(manifest.read_text(encoding="utf-8")).get(
-                                "currentEventId", ""
-                            )
+                            manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+                            if isinstance(manifest_data, dict):
+                                current_event = manifest_data.get("currentEventId", "")
                         except (json.JSONDecodeError, OSError):
                             pass
                     for sub in pkg.iterdir():
@@ -8020,7 +8020,8 @@ it.
 
 Arm a loop on your own session with `monitor_start`, carrying the cycle
 instructions AND the exit condition, then end the turn. A reply saying
-*requested* is success — do not retry it. If arming is refused outright, say no
+*requested* confirms receipt only — do not retry it in the same turn.
+Confirm activation from the gateway arm notice or `monitor_inspect` on a later turn. If arming is refused outright, say no
 loop is running and drive that one round with `wait`. Call `autonudge_stop` when
 you stop. (The loop is on a timer today. When `monitor_start` accepts a
 `watch: "work-ledger"` field, gate on that instead and the quiet cycles stop
@@ -8203,6 +8204,10 @@ handle immediately.
 #:   goes to ``/api/chat/slots/<target>/tags`` where the target is the session
 #:   named in the ARGUMENTS — the same shape as ``chat_folder_move_session``.
 #:   Ingested content could re-label any persistent same-workspace session.
+#: * ``chat_session_pin`` — WITHHELD. Writes another session's ``pinned`` flag:
+#:   the PATCH goes to ``/api/chat/slots/<target>/pin`` where the target is the
+#:   session named in the ARGUMENTS, the same shape as ``chat_tag_assign``, and
+#:   no conductor step needs it.
 #: * ``session_send`` — WITHHELD. Runs text as another session's user-role turn
 #:   under that target's own grants. The server-side gates bound WHICH target is
 #:   reachable; nothing bounds WHAT is sent.
@@ -9202,7 +9207,8 @@ in that case.
 
 **Patrol with `monitor_start`, never with `wait`.** Arm it with the full cycle
 instructions AND the exit condition, then end the turn; call `autonudge_stop`
-when you stop. A reply saying *requested* is success — do not retry it. If
+when you stop. A reply saying *requested* confirms receipt only — do not retry it in the same turn.
+Confirm activation from the gateway arm notice or `monitor_inspect` on a later turn. If
 arming is refused outright, say no loop is running and drive that one round
 with `wait`. A quiet cycle is one line, then end the turn.
 
@@ -10156,7 +10162,8 @@ gate is the correct state; assuming its answer is not.
 
 **Patrol with `monitor_start`, never with `wait`.** Arm it with the full cycle
 instructions AND the exit condition, then end the turn; call `autonudge_stop`
-when you stop. A reply saying *requested* is success — do not retry it. If
+when you stop. A reply saying *requested* confirms receipt only — do not retry it in the same turn.
+Confirm activation from the gateway arm notice or `monitor_inspect` on a later turn. If
 arming is refused outright, say no loop is running and drive that one round
 with `wait`. A quiet cycle is one line, then end the turn.
 

@@ -1537,6 +1537,13 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "environment map is those four named keys and no others, and is omitted "
         "entirely unless a caller asks for it.",
     ),
+    (
+        "MCP launch approval display records",
+        "mcp_gateway/launch_approval.py",
+        "Command and argument display values persisted in the sealed approval store "
+        "and returned by dashboard status. Both shared redactors run before storage, "
+        "so raw launch values do not enter durable operator-facing state.",
+    ),
 )
 
 # Modules that call a redactor but are NOT an output egress boundary, so they do
@@ -1576,6 +1583,11 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # goes out to a human.
         "context.py",
         "agent.py",
+        # Gate-side audit hygiene: the tool gate clips and redacts the tool labels
+        # and refusal reason of each permission decision before writing them to
+        # the SEL audit log. That is a local audit record, not an output bound for
+        # a human or a third party.
+        "permission_floor.py",
         # Transfer-side log hygiene: both redact a URL down to scheme+host before it
         # reaches a gateway log line ("Downloading %s from %s", a fetch failure, a
         # manifest that overran its byte bound). The url is operator- or
@@ -1662,6 +1674,18 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "subagent_manager/monitoring.py",
         "subagent_manager/run.py",
         "subagent_manager/terminal.py",
+        # Internal partitions behind the single registered
+        # ``apps/builtins/aws_control/backend/backup.py`` boundary, which keeps every
+        # outbound archive and label PUT. ``egress_text`` defines the redaction sequence
+        # the engine applies to exported conversation rows, published and foreign labels
+        # and the recorded nightly failure text; ``nightly`` applies it to that failure
+        # text, which the status route serves (the call-site scan matches its read of the
+        # outbound-redaction switch, ``_unattended_sessions_redaction_gap``);
+        # ``retention`` redacts only its gate-side log lines and SEL audit text. The split
+        # adds no transport or audience and therefore no posture row.
+        "apps/builtins/aws_control/backend/backup_parts/egress_text.py",
+        "apps/builtins/aws_control/backend/backup_parts/nightly.py",
+        "apps/builtins/aws_control/backend/backup_parts/retention.py",
         # The shared recursive redactor helper itself — a pure scrubber, not an
         # egress boundary; the modules that CALL it (mochi routes/hooks) are the
         # registered sinks.
@@ -1769,6 +1793,10 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # path is covered BY redaction, when what covers it is withholding -- the
         # same overstatement the decision-seam entry above refuses for refusal.
         "builtin_skills/pipeline-conductor/scripts/fleet_probe.py",
+        # The loop stop record: store-sourced ids and caller reasons are scrubbed
+        # before they are held in memory or written to the gateway log. Local
+        # diagnostics, not an egress pass.
+        "autonudge_stop_log.py",
         # Inbound structured-monitor target validation. A canonical provider URL
         # is rejected when its path contains credential-shaped text, before the
         # target reaches persistence, inspection, or a wake envelope.
@@ -1914,6 +1942,16 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "dashboard/notification_coordinator.py",
         "dashboard/slot_projection.py",
         "dashboard/websocket_hub.py",
+        # Owners extracted from dashboard/handlers/source_providers.py, which keeps
+        # the HTTP handlers. They redact provider data before it is cached or
+        # returned through those handlers, but they add no logical egress path:
+        # the same source-provider boundaries the handler entry covered, split by
+        # responsibility, so the decomposition leaves the posture items unchanged.
+        "dashboard/source_providers/adf.py",
+        "dashboard/source_providers/cache.py",
+        "dashboard/source_providers/chip_refresh.py",
+        "dashboard/source_providers/review.py",
+        "dashboard/source_providers/sanitize.py",
         # Pre-redacts follow-up items before handing to state.py's WS egress
         # (the registered sink); its own return string is re-redacted by
         # chat_runner before broadcast. Not itself an egress boundary.
@@ -1940,7 +1978,6 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "dashboard/handlers/memory.py",
         "dashboard/handlers/optimizer.py",
         "dashboard/handlers/prompts.py",
-        "dashboard/handlers/source_providers.py",
         "dashboard/handlers/taskrunner.py",
         "dashboard/handlers/terminal.py",
         "dashboard/handlers/themes.py",
@@ -2179,7 +2216,12 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # electron-builder's stderr (a registry URL can carry a token) before
         # the bounded tail is printed. Same classification as cli_commands.py.
         "cli_setup.py",
-        "apps/builtins/issue_radar/backend/routes.py",
+        # Issue Radar's route layer: its AI routes redact the model's own output
+        # (summaries, label reasons, recommendation text) before caching or
+        # returning it. These three modules hold those calls.
+        "apps/builtins/issue_radar/backend/http_routes/ai.py",
+        "apps/builtins/issue_radar/backend/http_routes/recommendations.py",
+        "apps/builtins/issue_radar/backend/http_routes/tagging.py",
         "apps/builtins/meetings/backend/domain/session.py",
         # Live translation redacts the MODEL's answer before writing it to the
         # meeting's translations.json. The source line was already redacted at

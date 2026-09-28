@@ -27,9 +27,27 @@ schedules the loop. Those two `monitor_start` surfaces are the only callers that
 ask for the gate; the chokepoint defaults every other caller UNGATED, the generic
 REST route included. Gating is the state that can silently stop work, so a caller
 that names no value resolves toward spending a turn per interval rather than toward
-a watch that deactivates itself. A loop whose instruction names exactly one public
-GitHub pull request attaches `PrWatchProbe`, which FETCHES that pull request every
-tick and hands the reading to the wake judge.
+a watch that deactivates itself.
+
+A gated loop's WATCHED SUBJECT comes from the two strings it holds, resolved in one
+place (`autonudge.infer_subject`) so the monitor and the judge's collector are about
+the same pull request. The judge brief's `targets` list is read first, because
+`autonudge_judge.parse_targets` reads it first and asks about nothing else once it is
+present. A brief naming exactly one public GitHub pull request supplies the subject
+when the instruction names none, which is what makes a loop armed as "Babysit PR
+13936" with the URL in its brief watchable at all. Otherwise the INSTRUCTION decides:
+when it names its own pull request the watch stays on that one even if the brief names
+a different one, since a brief naming a blocker is an evidence scope and not a subject
+declaration. A brief naming two or more pull requests leaves the instruction deciding,
+because a loop holds one monitor. Resolution can answer "no subject", in which case no
+probe is attached and the loop fires on its plain interval: an instruction naming a
+pull request only in a shorthand (`owner/name#123`, `PR #42`) carries no host and
+`#123` is equally an issue reference, and an instruction naming two at once is not
+resolved by preferring either. A loop that does resolve to one subject attaches
+`PrWatchProbe`, which FETCHES that pull request every tick and hands the reading to
+the wake judge. A retarget that changes the subject advances `config_generation`, so a
+structural-terminal verdict recorded for the old subject cannot deactivate the new
+watch.
 
 There is no script-cron driver. A babysit request uses `monitor_watch` or a finite
 `monitor_start` loop owned by the session that can inspect and act on a wake, both
@@ -149,7 +167,8 @@ The schemas in `validation.MONITOR_START_SCHEMA` and
 `validation.MONITOR_UPDATE_SCHEMA` bound the message, interval, cycle cap, and
 wall-clock budget. `mcp_tools.control.monitor_start` supplies bounded positive
 defaults from `mcp_tools._limits`; zero and negative cycle or runtime limits are
-rejected. The cap is a runaway backstop, not evidence that the watched work
+rejected. The operator ceiling is `monitoring.max_runtime_secs`; setting 2592000
+permits a 30-day request without extending existing loops. The cap is a runaway backstop, not evidence that the watched work
 completed: `AutoNudgeService._timer` deactivates a capped loop and emits
 `expired`.
 
@@ -164,8 +183,24 @@ patches its message or limits through `authorize_and_update_nudge`. It does
 not accept a loop identifier. `_monitor_update` refuses a new cap or budget
 that cannot yield another fire and never revives a manual pause as a side
 effect. It may re-arm a loop stopped by its own cycle cap or runtime budget
-only when the relevant bound is raised; the paused-loop and bound-revival
-tests in `test_autonudge_stop_auth.py` pin those distinctions.
+only when the relevant bound is raised, from a user turn or from the loop's own
+delivered wake; a wake cannot revive a loop a person stopped or paused. The
+paused-loop and bound-revival tests in `test_autonudge_stop_auth.py` pin those
+distinctions.
+
+A delivered wake may arm a monitor (`monitor_start`, `monitor_watch`) only
+while the loop that fired it is still its own: the wake carries that loop's id,
+and `apply_session_directive` reads the row back before the authorizer runs. A
+row that is gone (a prompt-loop Stop removes it) or that a person stopped (a
+retained `USER_STOP` record, a manual pause, an empty reason) refuses the arm; a
+row that is active, or that its own cycle cap, runtime budget, terminal subject
+or dropped sentinel deactivated, admits it, and the create-only and
+`replace_stopped` rules then decide as for any other arm. The self-arm tests in
+`test_autonudge_member_self_arm.py` and `test_monitor_directive_apply.py` pin
+the four answers. When the wake carries a loop id, its `monitor_update`,
+`monitor_stop`, and `autonudge_stop` directives apply only while that id is the
+monitor currently bound to the session; a replacement monitor is never mutated
+by the stale wake.
 
 `autonudge_stop` is deliberately non-confirming at tool-call time because the
 consumer applies it after the turn result is processed. The applier removes an

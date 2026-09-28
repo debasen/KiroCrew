@@ -113,8 +113,23 @@ def _write_cli_overlay(
     """Write a workspace cli.json overlay so kiro-cli applies effort at spawn.
 
     Path: ``<work_dir>/.kiro/settings/cli.json``. Workspace settings override
-    the global ``~/.kiro/settings/cli.json`` so this only affects the slot's
-    own session. Merge-safe and idempotent — safe to call before every spawn.
+    the global ``~/.kiro/settings/cli.json``, so nothing here touches the user's
+    global kiro settings. The overlay's scope is that WORK DIRECTORY, not a
+    session: every session served by one runtime shares the work dir, so the
+    file is shared by all of them, and kiro-cli reads it only at spawn. A write
+    therefore reaches no session that is already running -- it lands on the next
+    respawn, and then for every session that respawn serves. Merge-safe and
+    idempotent — safe to call before every spawn.
+
+    Its unit of state is therefore ``(work_dir, model)`` and never
+    ``(session, model)``: two sessions on one runtime running the same model have
+    one entry between them, and the last write is the one a respawn reads.
+    Nothing reaches this writer except :class:`AcpProvider`, which is the object
+    that spawns the runtime and so always owns it, which is why a live effort
+    change is pushed to the running session separately
+    (:meth:`AcpProvider.change_effort`) rather than through this file. A session
+    that joins a runtime it did not spawn has no path here at all today; if one
+    is added, it needs to say that its write cannot reach the running process.
 
     The effort sub-key is family-specific (``effort_settings_key``): Claude
     models use ``output_config``, GPT models use ``reasoning`` — kiro-cli
@@ -173,10 +188,12 @@ def _write_tool_search_overlay(
 ) -> None:
     """Write kiro Tool Search settings into the workspace cli.json overlay.
 
-    Path: ``<work_dir>/.kiro/settings/cli.json`` — the SAME per-session overlay
-    used for effort. Workspace settings override the global
-    ``~/.kiro/settings/cli.json`` so this only affects this slot's own kiro-cli
-    session and never mutates the user's global kiro settings.
+    Path: ``<work_dir>/.kiro/settings/cli.json`` — the SAME overlay used for
+    effort, with the same scope: the work directory, which every session on a
+    runtime shares, read by kiro-cli only at spawn (see
+    :func:`_write_cli_overlay`). Workspace settings override the global
+    ``~/.kiro/settings/cli.json``, so this never mutates the user's global kiro
+    settings.
 
     This file is the kiro-cli (Rust engine) channel only. KAS never opens it: its
     Tool Search setting rides the ACP ``initialize`` request instead (see
@@ -2289,8 +2306,8 @@ class AcpProvider(LLMProvider):
             async for e in events:
                 yield self._to_llm_event(e)
 
-    async def approve_tool(self, request_id: str | int, *, always: bool = False) -> None:
-        await self._client.approve_tool(request_id, always=always)
+    async def approve_tool(self, request_id: str | int, *, always: bool = False) -> bool:
+        return await self._client.approve_tool(request_id, always=always)
 
     async def reject_tool(self, request_id: str | int) -> None:
         await self._client.reject_tool(request_id)
@@ -2489,6 +2506,13 @@ class AcpProvider(LLMProvider):
         await self._client.new_conversation()  # type: ignore[attr-defined]
 
     def is_alive(self) -> bool:
+        """Whether the shared client is responsive.
+
+        PROCESS-level, like every liveness answer on this provider: the client is
+        one kiro-cli process that may host several ACP sessions, so co-tenants
+        cannot be told apart here. Read it as "the process serving me is up", not
+        as "my session is usable".
+        """
         return self._client.is_responsive()
 
     def is_process_alive(self) -> bool:
@@ -2560,6 +2584,11 @@ class AcpProvider(LLMProvider):
         return err if isinstance(err, InfraError) else None
 
     def touch_activity(self) -> None:
+        """Refresh the CLIENT's activity clock.
+
+        PROCESS-level: the stamp lives on the shared client, so this marks every
+        session on that process active, not just this one.
+        """
         self._client.touch_activity()
 
     def runtime_info(self) -> tuple[int | None, str | None]:

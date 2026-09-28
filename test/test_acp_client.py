@@ -63,6 +63,18 @@ _POSIX_EXEC_PATHS_ONLY = pytest.mark.skipif(
 
 
 @pytest.fixture(autouse=True)
+def _pin_the_installed_kiro_cli_version(monkeypatch):
+    """The writer gate in ``_write_derived_permissions`` reads
+    ``installed_kiro_cli_version`` function-locally, and on a host with a kiro-cli
+    installed that is one REAL ``kiro-cli --version`` spawn per binary identity --
+    32 per full run of this file on a five-run hygiene sweep, from tests that drive
+    protocol and process doubles. The version the gate sees is a property of the
+    host, not of the client under test; ``None`` is the "cannot be established"
+    branch every host without the binary already takes."""
+    monkeypatch.setattr("kiro_crew.kiro_cli.installed_kiro_cli_version", lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def _native_projection_for_fake_processes(monkeypatch):
     from kiro_crew.acp import skill_projection
 
@@ -6283,6 +6295,23 @@ class TestBuildPermissionEvent:
 class TestApproveTool:
     """Tests for approve_tool always= and recorded-option dispatch."""
 
+    @pytest.fixture(autouse=True)
+    def _recorded_requests(self, monkeypatch):
+        """Every id approved here stands for a request the client built an event for."""
+        from kiro_crew.acp.types import EVENT_PERMISSION_REQUEST, AcpEvent
+
+        class _Recorded(dict):
+            def pop(self, key, default=None):
+                return AcpEvent(kind=EVENT_PERMISSION_REQUEST, request_id=key, title="notes.txt")
+
+        original = AcpClient.__init__
+
+        def _init(self, *args, **kwargs):
+            original(self, *args, **kwargs)
+            self._permission_gate_events = _Recorded()
+
+        monkeypatch.setattr(AcpClient, "__init__", _init)
+
     @pytest.mark.asyncio
     async def test_always_uses_recorded_optionid(self, tmp_path):
         from kiro_crew.acp.types import OUTCOME_SELECTED
@@ -7415,7 +7444,7 @@ class TestExtractToolCallUpdate:
         while nothing will read it is work the default path must not do. ``-1``
         distinguishes "not recorded" from a real zero-length output.
         """
-        monkeypatch.delenv("KIROCREW_CREW_LOG", raising=False)
+        monkeypatch.setenv("KIROCREW_CREW_LOG", "0")
         client = self._client()
         msg = self._make_msg(
             {

@@ -2448,3 +2448,106 @@ class TestThePushNeverNeedsARefusal:
         assert "EFFORT_LEVELS[: start + 1]" in body
         assert "_is_config_value_rejection(exc, effort_option)" in body
         assert "effort_config_option_value(self._client.backend, level)" in body
+
+
+# What pi-acp 0.0.34 answered, driving pi 0.87.1, when ``session/set_config_option``
+# asked for a ``provider/model`` id absent from pi's ``models.json``. Verbatim off a
+# live session but for the model id: pi-acp wraps pi's own ``set_model`` failure in a
+# bare -32603, so neither the code nor the option name says the VALUE was refused.
+_PI_MODEL_NOT_FOUND = (
+    "JSON-RPC error: {'code': -32603, 'message': 'Internal error', 'data': "
+    "{'details': 'pi set_model failed: Model not found: ollama/gone-model'}}"
+)
+
+
+class TestAModelPiCannotSelectLeavesTheSessionOnItsDefault:
+    """A stale model pin must not kill every pi session at startup.
+
+    The pin can be one pi advertised earlier -- its list follows the operator's
+    ``models.json`` and which provider keys are set -- so it goes stale on an edit
+    Crew never sees. Every other harness on the config-option channel reads such a
+    refusal as a refused VALUE and stays on its default; pi's refusal arrived in a
+    shape the shared reader did not know, so it was re-raised as a protocol fault and
+    the session never started.
+    """
+
+    def _client(self, tmp_path, monkeypatch, backend=ACP_BACKEND_PI):
+        client = acp_client.AcpClient(work_dir=tmp_path, acp_backend=backend)
+        client._session_id = "pi-sess"
+        sent: list[tuple[str, str]] = []
+
+        async def refuse(config_id: str, value: str) -> None:
+            sent.append((config_id, value))
+            raise acp_client.AcpError(_PI_MODEL_NOT_FOUND, code=-32603)
+
+        monkeypatch.setattr(client, "set_config_option", refuse)
+        return client, sent
+
+    def test_an_inherited_pin_falls_back_to_the_default(self, tmp_path, monkeypatch):
+        client, sent = self._client(tmp_path, monkeypatch)
+
+        applied = asyncio.run(client._push_model_config_option("ollama/gone-model", strict=False))
+
+        assert applied == ""
+        assert sent and sent[0] == ("model", "ollama/gone-model")
+
+    def test_an_explicit_pick_names_the_model(self, tmp_path, monkeypatch):
+        client, _sent = self._client(tmp_path, monkeypatch)
+
+        with pytest.raises(acp_client.AcpModelUnavailable):
+            asyncio.run(client._push_model_config_option("ollama/gone-model", strict=True))
+
+    def test_the_phrase_is_read_only_for_pi(self, tmp_path, monkeypatch):
+        """Another harness's -32603 stays a protocol fault, whatever its text says."""
+        client, _sent = self._client(tmp_path, monkeypatch, backend=ACP_BACKEND_OPENCODE)
+
+        with pytest.raises(acp_client.AcpError) as raised:
+            asyncio.run(client._push_model_config_option("ollama/gone-model", strict=False))
+        assert not isinstance(raised.value, acp_client.AcpModelUnavailable)
+
+    def test_the_phrase_is_read_only_for_the_model_option(self):
+        exc = acp_client.AcpError(_PI_MODEL_NOT_FOUND, code=-32603)
+
+        assert acp_client._is_config_value_rejection(exc, "model", ACP_BACKEND_PI)
+        assert not acp_client._is_config_value_rejection(exc, "thought_level", ACP_BACKEND_PI)
+        assert not acp_client._is_config_value_rejection(exc, "model")
+
+
+def test_a_cancel_answers_the_open_gate_dialog_as_cancelled(tmp_path):
+    """ACP: after ``session/cancel`` the client answers every open permission request.
+
+    pi-acp keeps a cancelled turn open while the gate extension's dialog is unanswered,
+    so a Stop from a surface that did not reject the open approval first waited out the
+    whole ack budget and hard-killed the process. The frame is the live capture's own.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    path = ROOT / "test" / "fixtures" / "acp_frames" / "pi" / "permission-request-live.jsonl"
+    frame = next(
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if '"session/request_permission"' in line
+    )
+    client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_PI)
+    proc = MagicMock()
+    proc.returncode = None
+    proc.stdin.drain = AsyncMock()
+    client._process = proc
+    client._session_id = frame["params"]["sessionId"]
+    client._build_permission_event(
+        JsonRpcMessage(id=frame["id"], method=frame["method"], params=frame["params"])
+    )
+
+    asyncio.run(client.cancel_session())
+
+    written = [
+        json.loads(line)
+        for call in proc.stdin.write.call_args_list
+        for line in call.args[0].decode().splitlines()
+    ]
+    assert [w.get("method") for w in written] == ["session/cancel", None]
+    assert written[1] == {
+        "jsonrpc": "2.0",
+        "id": frame["id"],
+        "result": {"outcome": {"outcome": "cancelled"}},
+    }

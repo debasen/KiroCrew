@@ -69,7 +69,7 @@ import {
   normalizeAutomationRecord,
   type AutomationRecord,
 } from '../monitoring/automation'
-import { fetchFileRead, fileReadQueryKey, FILE_READ_STALE_MS } from '../utils/fileReadQuery'
+import { fetchFileRead, fileReadQueryKey, FILE_READ_STALE_MS, isPartialRead } from '../utils/fileReadQuery'
 import { safeSetItem, safeSetSessionItem } from '../utils/safeStorage'
 import { handleStopPress, isEscalationState } from '../utils/stopDebounce'
 import { EmptyState, Btn, Input } from '../components/ui'
@@ -357,6 +357,7 @@ import type { ChatMessage } from '../types'
 import { shouldMountSidePanel, isSidePanelHidden, sidePanelDockMotion } from './chat/sidePanelMount'
 import type { ParsedSubagentCompletion } from './chat/subagentCompletion'
 import { useConnectionsUiEnabled } from '../hooks/useConnectionsUi'
+import { useKirocrewConfigReader } from '../hooks/useKirocrewConfigReader'
 import TurnBlock from './chat/TurnBlock'
 import Clickable from '../components/Clickable'
 import WorkflowProgressBar from './chat/WorkflowProgressBar'
@@ -370,6 +371,20 @@ import { errMessage } from '../utils/thunkError'
 import { i18nT } from '../i18n/t'
 import { fmtDateFields } from '../i18n/format'
 import { fmtMessageTime, fmtMessageTimeFull } from './chat/messageTime'
+
+/**
+ * Horizontal room the chat pane reclaims (negative margin) while the desktop
+ * sessions sidebar is collapsed: the gap the open panel kept between itself and
+ * the pane. Every pane-space offset that clears the stationary toggle adds it.
+ */
+const COLLAPSED_PANE_RECLAIM_PX = 8
+/**
+ * Leading clearance for the open-session strip while the desktop sessions
+ * sidebar is collapsed. The pane's reclaimed margin moves the toggle's
+ * container-space right edge (x + size) that much farther into the strip; the
+ * final 4px keeps the first tab visibly separate from the control.
+ */
+const COLLAPSED_SESSION_TABS_INSET = TOGGLE_RECT.x + TOGGLE_RECT.size + COLLAPSED_PANE_RECLAIM_PX + 4
 /**
  * Human-readable reason from a rejected thunk. `unwrap()` rejects with RTK's
  * SERIALIZED error — a plain object, never an `Error` instance — so an
@@ -3935,7 +3950,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         const text = r.data.ok ? r.data.text : i18nT('pages.chatPage.file_not_found_on_disk_it_may_have_been_moved_or')
         // The verdict is re-established by the same read that refills the
         // buffer -- it was stripped from persistence alongside the content.
-        tabsCtl.patchTab(t.id, { content: text, savedContent: text, binary: r.data.ok && r.data.binary })
+        tabsCtl.patchTab(t.id, { content: text, savedContent: text, binary: r.data.ok && r.data.binary, partial: r.data.ok && isPartialRead(r.data) })
       } else if ((r.data || r.isError) && !reportedColdReadsRef.current.has(t.id)) {
         // The tab stays cold (its buffer untouched, so the next chip/tree click
         // retries the read) and the failure is reported above the composer.
@@ -4080,9 +4095,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // default — the backend applies `slot.reasoning_effort or agent.reasoning_effort`
   // — so the composer must show the inherited value rather than a bare
   // "Default", which read as "the model decides" and hid the real setting.
+  const readKirocrewConfig = useKirocrewConfigReader()
   const { data: _defaultEffort } = useQuery({
     queryKey: ['default-effort', provider.id],
-    queryFn: () => provider.resolveDefaultEffort(),
+    queryFn: () => provider.resolveDefaultEffort(readKirocrewConfig),
     enabled: provider.capabilities.reasoningEffort,
   })
   const defaultEffort = _defaultEffort || ''
@@ -6939,7 +6955,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         )}
       </AnimatePresence>
       {embedMode === 'chat' ? null : embedMode === 'sessions' ? (
-        <div className="flex-1 min-w-0 h-full overflow-hidden [&_.sidebar-inner]:!w-full [&_.sidebar-inner]:!border-0 [&_.sidebar-inner]:!rounded-none [&_.sidebar-inner]:!shrink [&_.sidebar-inner]:!bg-bg [&_.sidebar-resize-handle]:!hidden">
+        <div className="flex-1 min-w-0 h-full overflow-hidden [&_.sidebar-inner]:!w-full [&_.sidebar-inner]:!border-0 [&_.sidebar-inner]:!rounded-none [&_.sidebar-inner]:!shrink [&_.sidebar-inner]:!bg-bg [--folder-row-sticky-bg:var(--bg)] [&_.sidebar-resize-handle]:!hidden">
           <ChatSidebar
             slots={filteredSlots}
             activeSlot={null}
@@ -7003,7 +7019,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
 
       {/* Chat pane */}
       {embedMode !== 'sessions' && (
-      <div ref={setChatPaneEl} className={`relative flex flex-col bg-bg min-w-0 min-h-0 h-full overflow-hidden ${(activityOpen && !activitySlot) || search.isOpen ? 'flex-[1_1_60%]' : 'flex-1'}`} style={{ transition: 'flex 0.2s', ...(!sidebarOpen && !isMobile ? { marginLeft: '-0.5rem' } : {}), '--mc-content-width': scaleContentWidth(CONTENT_WIDTH[chatConfig.contentWidth], chatConfig.contentWidth, chatConfig.messageFontSize).messages, '--mc-input-width': scaleContentWidth(CONTENT_WIDTH[chatConfig.contentWidth], chatConfig.contentWidth, chatConfig.messageFontSize).input } as React.CSSProperties}>
+      <div ref={setChatPaneEl} className={`relative flex flex-col bg-bg min-w-0 min-h-0 h-full overflow-hidden ${(activityOpen && !activitySlot) || search.isOpen ? 'flex-[1_1_60%]' : 'flex-1'}`} style={{ transition: 'flex 0.2s', ...(!sidebarOpen && !isMobile ? { marginLeft: -COLLAPSED_PANE_RECLAIM_PX } : {}), '--mc-content-width': scaleContentWidth(CONTENT_WIDTH[chatConfig.contentWidth], chatConfig.contentWidth, chatConfig.messageFontSize).messages, '--mc-input-width': scaleContentWidth(CONTENT_WIDTH[chatConfig.contentWidth], chatConfig.contentWidth, chatConfig.messageFontSize).input } as React.CSSProperties}>
         {snipFrame && (
           <SnipOverlay
             frame={snipFrame}
@@ -7168,7 +7184,24 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         {activeSlot && ownsSessionTabs && !(splitMode && splitFeatureEnabled) && (
           // no-drag: on the desktop shell the top strip of the window is the
           // titlebar drag region, and a tab you cannot click is worse than no tab.
-          <div style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+          //
+          // While the desktop sidebar is collapsed the shell insets the strip
+          // past the stationary toggle, gliding on the same 240ms curve as the
+          // panel morph and the title row so the tabs do not jump at the start
+          // of the slide. The shell owns the strip's bottom divider (the strip
+          // draws none of its own): an inset border on the strip's root would
+          // stop short of the gutter and leave a notch under the toggle, so
+          // the shell draws one continuous hairline across the full width.
+          // `empty:hidden` keeps the shell out of the layout when the strip
+          // renders nothing (fewer than two tabs), so the divider it owns
+          // appears only when the strip does.
+          <div
+            className="empty:hidden border-b border-border transition-[padding-left] duration-[240ms] [transition-timing-function:cubic-bezier(.32,.72,0,1)]"
+            style={{
+              WebkitAppRegion: 'no-drag',
+              paddingLeft: !sidebarOpen && !isMobile ? COLLAPSED_SESSION_TABS_INSET : 0,
+            } as React.CSSProperties}
+          >
             <SessionTabStrip
               tabs={sessionTabs.tabs}
               activeKey={activeSlot}

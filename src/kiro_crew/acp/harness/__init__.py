@@ -19,6 +19,7 @@ REFUSES a backend with no harness rather than serving it as kiro-cli.
 
 from __future__ import annotations
 
+from kiro_crew.acp.harness.agy import AgyLaunch
 from kiro_crew.acp.harness.base import (
     HarnessAdapter,
     LaunchAdapter,
@@ -31,7 +32,6 @@ from kiro_crew.acp.harness.base import (
     SpawnPlan,
     TeardownPolicy,
 )
-from kiro_crew.acp.harness.agy import AgyLaunch
 from kiro_crew.acp.harness.claude import ClaudeLaunch
 from kiro_crew.acp.harness.codex import CodexHarness
 from kiro_crew.acp.harness.deepseek import DeepseekLaunch

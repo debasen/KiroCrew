@@ -537,7 +537,6 @@ BASELINE_SELECTABLE_BACKENDS: FrozenSet[str] = frozenset(
         ACP_BACKEND_PI,
         ACP_BACKEND_GOOSE,
         ACP_BACKEND_DEEPSEEK,
-        ACP_BACKEND_AGY,
     }
 )
 
@@ -1006,7 +1005,6 @@ ACP_BACKENDS_MEMBER_DISPATCH = frozenset(
         ACP_BACKEND_CODEX,
         ACP_BACKEND_OPENCODE,
         ACP_BACKEND_GOOSE,
-        ACP_BACKEND_AGY,
     }
 )
 
@@ -1458,7 +1456,7 @@ ACP_BACKENDS_ACP_RUNTIME = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BAC
 # a member because Crew reads the spec itself and hands it over the wire, so the
 # on-disk form is Crew's to parse; codex-acp, opencode and pi are not members
 # because none of them reads ``~/.kiro/agents`` at all.
-ACP_BACKENDS_MARKDOWN_AGENT_SPECS = frozenset({ACP_BACKEND_KAS, ACP_BACKEND_AGY})
+ACP_BACKENDS_MARKDOWN_AGENT_SPECS = frozenset({ACP_BACKEND_KAS})
 
 # Backends whose agent spec comes from the USER-LEVEL directory alone, so a
 # checkout's same-named spec is not the agent their session is running.
@@ -2119,7 +2117,7 @@ ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD = frozenset({ACP_BACKEND_KIRO})
 # see: that posture is enforced by the harness's own sandbox, which denies rather
 # than asks, so no call reaches the host gate and no SEL row is written. A side turn
 # on it runs ``REJECT_ALL``.
-ACP_BACKENDS_SIDE_READONLY = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_AGY})
+ACP_BACKENDS_SIDE_READONLY = frozenset({ACP_BACKEND_KIRO})
 
 # Backends whose process answers ``session/new``, ``session/load`` and
 # ``session/set_mode`` one at a time, so a session start sent while one of those is
@@ -2429,7 +2427,7 @@ ACP_BACKEND_ROUTING: dict = {
     # extension Crew composes, which is this member, and the frame corpus carries the
     # live capture (``test/fixtures/acp_frames/deepseek/permission-request-live``).
     ACP_BACKEND_DEEPSEEK: Routing.VERIFIED_GATE_EXTENSION,
-    ACP_BACKEND_AGY: Routing.SEEDED_SETTINGS,
+    ACP_BACKEND_AGY: Routing.UNVERIFIED,
 }
 
 

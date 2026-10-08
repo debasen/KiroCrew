@@ -35,9 +35,8 @@ FIELD = "agent.acp_backend"
 
 #: Known ids the public baseline deliberately does not offer, each entry carrying its
 #: reason in ``test_baseline_ships_every_known_backend``. An entry is a reasoned
-#: exclusion rather than a defect, and it earns its place by naming what the id fails.
-#: ``agy`` is held here while it runs under Routing.UNVERIFIED without host permission-request mediation.
-NOT_SHIPPED_SELECTABLE: frozenset = frozenset({ACP_BACKEND_AGY})
+#: Empty today: no id is excluded.
+NOT_SHIPPED_SELECTABLE: frozenset = frozenset()
 
 
 @pytest.fixture
@@ -180,6 +179,7 @@ def test_baseline_ships_every_known_backend():
             ACP_BACKEND_PI,
             ACP_BACKEND_GOOSE,
             ACP_BACKEND_DEEPSEEK,
+            ACP_BACKEND_AGY,
         ]
     )
     assert baseline == sorted(acp_backends.ACP_BACKENDS_KNOWN - NOT_SHIPPED_SELECTABLE)

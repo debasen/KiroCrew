@@ -20,7 +20,7 @@ def test_agy_is_a_known_and_selectable_backend() -> None:
     """Known gates the kwarg; selectable is what the switch may persist."""
     assert AGY == "agy"
     assert AGY in sdk_backends.ACP_BACKENDS_KNOWN
-    assert AGY not in sdk_backends.BASELINE_SELECTABLE_BACKENDS
+    assert AGY in sdk_backends.BASELINE_SELECTABLE_BACKENDS
 
 
 def test_agy_provider_label() -> None:
@@ -31,7 +31,7 @@ def test_agy_provider_label() -> None:
 
 def test_agy_routing() -> None:
     """Routing disposition in ACP_BACKEND_ROUTING."""
-    assert sdk_backends.routing_for(AGY) is sdk_backends.Routing.UNVERIFIED
+    assert sdk_backends.routing_for(AGY) is sdk_backends.Routing.SEEDED_SETTINGS
 
 
 def test_agy_launch_record() -> None:
@@ -60,19 +60,19 @@ def test_agy_capability_sets() -> None:
     assert AGY in sdk_backends.ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION
     assert AGY in sdk_backends.ACP_BACKENDS_HARNESS_OWNED_SESSIONS
     assert AGY in sdk_backends.ACP_BACKENDS_SESSION_MCP_ARRAY
-    assert AGY not in sdk_backends.ACP_BACKENDS_MEMBER_DISPATCH
+    assert AGY in sdk_backends.ACP_BACKENDS_MEMBER_DISPATCH
 
-    assert AGY not in sdk_backends.ACP_BACKENDS_SIDE_READONLY
+    assert AGY in sdk_backends.ACP_BACKENDS_STEER
+    assert AGY in sdk_backends.ACP_BACKENDS_COMPACT
+    assert AGY in sdk_backends.ACP_BACKENDS_INLINE_COMPACTION
+    assert AGY in sdk_backends.ACP_BACKENDS_MARKDOWN_AGENT_SPECS
+    assert AGY in sdk_backends.ACP_BACKENDS_SIDE_READONLY
 
     # Not in unverified runtime sharing or internal sandbox
     assert AGY not in sdk_backends.ACP_BACKENDS_ACP_RUNTIME
     assert AGY not in sdk_backends.ACP_BACKENDS_INTERNAL_SANDBOX
     assert AGY not in sdk_backends.ACP_BACKENDS_SESSION_SHARING
     assert AGY not in sdk_backends.ACP_BACKENDS_SESSION_EVICTION
-    assert AGY not in sdk_backends.ACP_BACKENDS_STEER
-    assert AGY not in sdk_backends.ACP_BACKENDS_COMPACT
-    assert AGY not in sdk_backends.ACP_BACKENDS_INLINE_COMPACTION
-    assert AGY not in sdk_backends.ACP_BACKENDS_MARKDOWN_AGENT_SPECS
 
 
 @pytest.mark.asyncio
